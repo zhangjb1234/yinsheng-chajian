@@ -12,12 +12,24 @@
 
 ## 安装(约 2 分钟)
 
+> ⚠️ **不要**在酒馆的「安装扩展程序」输入框里贴本仓库地址 —— 那里只认前端扩展,
+> 本仓库是**服务端插件**,会报"找不到 manifest.json"。正确安装方式如下。
+
+**方式 A · git(推荐,便于以后更新):**
+
 1. 把本仓库克隆进酒馆的插件目录(在酒馆根目录打开终端):
 
    ```bash
    cd SillyTavern/plugins
    git clone https://github.com/zhangjb1234/yinsheng-chajian.git fish-tts
    ```
+
+**方式 B · 下载 ZIP(不想用 git):**
+
+1. 打开仓库页面 → 绿色 **Code** 按钮 → **Download ZIP** → 解压
+2. 把解压出的文件夹改名成 `fish-tts`,放进酒馆的 `plugins\` 目录
+
+**装完插件后,继续:**
 
 2. 配置工作目录:
 
