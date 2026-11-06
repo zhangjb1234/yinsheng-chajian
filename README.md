@@ -16,7 +16,7 @@
 
    ```bash
    cd SillyTavern/plugins
-   git clone https://github.com/zhangjb1234/moge.git fish-tts
+   git clone https://github.com/zhangjb1234/yinsheng-chajian.git fish-tts
    ```
 
 2. 配置工作目录:
