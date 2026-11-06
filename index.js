@@ -7,6 +7,8 @@
 // ============================================================
 const fs = require('node:fs');
 const path = require('node:path');
+const http = require('node:http');
+const tls = require('node:tls');
 const express = require('express');
 
 // ====== 读取同目录 config.json(见 config.example.json) ======
@@ -17,6 +19,8 @@ catch (e) { console.error('[fish-tts] 缺少或无法读取 config.json:', Strin
 const WORK_DIR = CONFIG.workDir || '';                       // voices.json / fish_api_key.txt / 素材文件夹 所在目录
 const FREE_MODEL = CONFIG.freeModel !== undefined ? CONFIG.freeModel : 's2.1-pro-free'; // 官方免费模型;政策变化可改 null 走计费
 const REF_TARGET_BYTES = 160000;                             // 参考片段挑选目标(≈25 秒 @48kbps)
+const PROXY = CONFIG.proxy || '';                            // 如 "http://127.0.0.1:7890";留空 = 直连
+const DIRECT_TIMEOUT_MS = 8000;                              // 直连超时(超时后走代理)
 
 const API_BASE = 'https://api.fish.audio';
 
@@ -73,6 +77,114 @@ function mpEnc(v, out) {
 }
 const mpPack = (obj) => { const out = []; mpEnc(obj, out); return Buffer.concat(out); };
 
+// —— 网络层:直连(fetch)优先,失败走本地代理(HTTP CONNECT 隧道) ——
+// 用 Node 自带 fetch 直连,带超时
+async function directFetch(url, headers, body) {
+    return fetch(url, {
+        method: 'POST', headers, body,
+        signal: AbortSignal.timeout(DIRECT_TIMEOUT_MS),
+    });
+}
+
+// 通过 HTTP 代理 CONNECT 隧道发请求(https 目标),返回 {statusCode, headers, body}
+function proxiedRequest(proxyUrl, urlStr, headers, body) {
+    const proxy = new URL(proxyUrl);
+    const u = new URL(urlStr);
+    const targetHost = u.hostname;
+    const targetPort = u.port || (u.protocol === 'https:' ? 443 : 80);
+    return new Promise((resolve, reject) => {
+        const req = http.request({
+            host: proxy.hostname,
+            port: parseInt(proxy.port || '80', 10),
+            method: 'CONNECT',
+            path: `${targetHost}:${targetPort}`,
+            headers: { Host: `${targetHost}:${targetPort}` },
+            timeout: 10000,
+        });
+        req.on('connect', (res, socket) => {
+            if (res.statusCode !== 200) {
+                socket.destroy();
+                return reject(new Error(`代理 CONNECT 失败: ${res.statusCode}`));
+            }
+            const writeRequest = (sock) => {
+                const h = Object.entries(headers).map(([k, v]) => `${k}: ${v}`).join('\r\n');
+                sock.write(`POST ${u.pathname}${u.search} HTTP/1.1\r\nHost: ${targetHost}\r\n${h}\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n`);
+                sock.write(body);
+            };
+            const collectFrom = (sock) => new Promise((res2, rej2) => {
+                const chunks = [];
+                sock.on('data', (d) => chunks.push(d));
+                sock.on('error', rej2);
+                sock.on('close', () => res2(Buffer.concat(chunks)));
+                sock.on('end', () => res2(Buffer.concat(chunks)));
+                // 总超时保护:60s 没完成就放弃
+                sock.setTimeout(60000, () => {
+                    sock.destroy();
+                    rej2(new Error('代理请求超时(60s)'));
+                });
+            });
+            const finish = (raw) => {
+                try {
+                    const idx = raw.indexOf('\r\n\r\n');
+                    if (idx === -1) return reject(new Error('代理响应格式异常'));
+                    const head = raw.subarray(0, idx).toString('utf8');
+                    let rest = raw.subarray(idx + 4);
+                    const lines = head.split('\r\n');
+                    const statusCode = parseInt(lines[0].split(' ')[1], 10);
+                    const respHeaders = {};
+                    for (const l of lines.slice(1)) {
+                        const i = l.indexOf(':');
+                        if (i > 0) respHeaders[l.slice(0, i).trim().toLowerCase()] = l.slice(i + 1).trim();
+                    }
+                    let buf = rest;
+                    if ((respHeaders['transfer-encoding'] || '').includes('chunked')) {
+                        const out = [];
+                        let p = 0;
+                        while (p < buf.length) {
+                            const lineEnd = buf.indexOf('\r\n', p);
+                            if (lineEnd === -1) break;
+                            const size = parseInt(buf.subarray(p, lineEnd).toString('utf8').split(';')[0], 16);
+                            if (!size) break;
+                            out.push(buf.subarray(lineEnd + 2, lineEnd + 2 + size));
+                            p = lineEnd + 2 + size + 2;
+                        }
+                        buf = Buffer.concat(out);
+                    }
+                    resolve({ statusCode, headers: respHeaders, body: buf });
+                } catch (e) { reject(e); }
+            };
+            if (u.protocol === 'https:') {
+                const tlsSock = tls.connect({ socket, servername: targetHost }, () => writeRequest(tlsSock));
+                tlsSock.on('error', reject);
+                collectFrom(tlsSock).then(finish, reject);  // 数据走 TLS 层,必须在这里收
+            } else {
+                writeRequest(socket);
+                collectFrom(socket).then(finish, reject);
+            }
+        });
+        req.on('timeout', () => req.destroy(new Error('代理连接超时')));
+        req.on('error', reject);
+        req.end();
+    });
+}
+
+// 统一入口:配置了代理就代理优先、直连兜底;否则只直连
+async function fishApiPost(path, headers, body) {
+    const url = `${API_BASE}${path}`;
+    if (PROXY) {
+        try {
+            const r = await proxiedRequest(PROXY, url, headers, Buffer.isBuffer(body) ? body : Buffer.from(body));
+            if (r.statusCode >= 500 && r.statusCode < 600) throw new Error(`代理通道 HTTP ${r.statusCode}`);
+            return { status: r.statusCode, headers: r.headers, body: r.body };
+        } catch (e) {
+            console.warn(`[fish-tts] 代理通道失败(${String(e).slice(0, 80)}),尝试直连…`);
+        }
+    }
+    const resp = await directFetch(url, headers, body);
+    const buf = Buffer.from(await resp.arrayBuffer());
+    return { status: resp.status, headers: Object.fromEntries(resp.headers.entries()), body: buf };
+}
+
 const init = (router) => {
     if (!WORK_DIR) console.error('[fish-tts] 未配置 workDir:请在插件目录创建 config.json(参考 config.example.json)');
 
@@ -128,23 +240,21 @@ const init = (router) => {
             const headers = { 'Content-Type': contentType, Authorization: 'Bearer ' + key };
             if (FREE_MODEL) headers.model = FREE_MODEL;
 
-            let resp = null;
+            let result = null;
             for (let i = 0; i < 3; i++) {
-                resp = await fetch(`${API_BASE}/v1/tts`, { method: 'POST', headers, body: payload });
-                if (resp.status !== 429) break;
-                const wait = parseInt(resp.headers.get('retry-after') || '5', 10) || 5;
-                console.log(`[fish-tts] 限流,${wait}s 后重试`);
-                await new Promise(r => setTimeout(r, wait * 1000));
+                result = await fishApiPost('/v1/tts', headers, payload);
+                if (result.status !== 429) break;
+                console.log('[fish-tts] 限流,5s 后重试');
+                await new Promise(r => setTimeout(r, 5000));
             }
-            if (!resp.ok) {
-                const detail = (await resp.text()).slice(0, 300);
-                return res.status(502).json({ error: `Fish API HTTP ${resp.status}: ${detail}` });
+            if (result.status !== 200) {
+                const detail = result.body.toString('utf8').slice(0, 300);
+                return res.status(502).json({ error: `Fish API HTTP ${result.status}: ${detail}` });
             }
-            const audio = Buffer.from(await resp.arrayBuffer());
             res.setHeader('Content-Type', 'audio/mpeg');
-            res.setHeader('Content-Length', String(audio.length));
-            res.end(audio);
-            console.log(`[fish-tts] ${voice}: ${text.slice(0, 20)}… -> ${audio.length} bytes`);
+            res.setHeader('Content-Length', String(result.body.length));
+            res.end(result.body);
+            console.log(`[fish-tts] ${voice}: ${text.slice(0, 20)}… -> ${result.body.length} bytes`);
         } catch (e) {
             res.status(500).json({ error: String((e && e.message) || e).slice(0, 200) });
         }
