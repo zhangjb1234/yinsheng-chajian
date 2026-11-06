@@ -1,0 +1,6 @@
+{
+  "name": "sillytavern-fish-tts",
+  "version": "1.0.0",
+  "description": "Fish Audio 语音合成服务端插件:voices.json 角色映射 + 即时克隆,配合酒馆助手脚本使用",
+  "main": "index.js"
+}
