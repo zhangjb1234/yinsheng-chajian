@@ -1,5 +1,0 @@
-{
-  "workDir": "C:\\path\to\\你的语音工作目录",
-  "proxy": "http://127.0.0.1:7890",
-  "freeModel": "s2.1-pro-free"
-}
