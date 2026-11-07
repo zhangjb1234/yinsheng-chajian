@@ -15,7 +15,7 @@ import {
     normalizeApiBase, readChatCompletion, readModelList,
 } from './text.js';
 
-const VERSION = '2.2.0';
+const VERSION = '2.2.1';
 const TAG = '[FishTTS]';
 
 // 在酒馆助手脚本（iframe）里运行时，所有界面都画在酒馆主页面上

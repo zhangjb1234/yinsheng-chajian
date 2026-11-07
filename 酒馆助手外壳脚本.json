@@ -3,7 +3,7 @@
   "enabled": true,
   "name": "Fish 语音朗读",
   "id": "9824a185-ad58-4f3f-8fce-ac1539077e74",
-  "content": "import 'https://gcore.jsdelivr.net/gh/zhangjb1234/yinsheng-chajian@v2.2.0/index.js'",
+  "content": "import 'https://gcore.jsdelivr.net/gh/zhangjb1234/yinsheng-chajian@v2.2.1/index.js'",
   "info": "Fish Audio 语音朗读（外壳脚本）。功能和设置与扩展版完全相同，设置在「扩展」页的 Fish Audio 语音朗读抽屉里。出新版本时只需把 @ 后面的版本号改成新的标签，例如 @v2.2.1。已经用扩展方式安装的话不要再启用这个脚本。",
   "button": {
     "enabled": false,
