@@ -15,7 +15,7 @@ import {
     normalizeApiBase, readChatCompletion, readModelList,
 } from './text.js';
 
-const VERSION = '2.2.1';
+const VERSION = '2.3.0';
 const TAG = '[FishTTS]';
 
 // 在酒馆助手脚本（iframe）里运行时，所有界面都画在酒馆主页面上
@@ -68,6 +68,7 @@ const DEFAULTS = {
     narratorVoice: NARRATOR_SAME,
     historyLimit: 300,
     cacheMB: 80,
+    favOnly: false,            // 我的音色列表只看收藏
     // 语气标签与 AI
     emoEnabled: true,          // 把 [语气标签] 发给 Fish；关掉时合成前去掉所有方括号标签
     editBeforeRead: 'off',     // off：直接读；manual：点 🎧 时先打开编辑器；always：自动朗读也先打开编辑器
@@ -346,6 +347,7 @@ function sanitizeVoice(v) {
         tags: Array.isArray(v.tags) ? v.tags.map(String).slice(0, 6) : [],
         author: String(v.author || '').slice(0, 40),
         addedAt: Number(v.addedAt) || Date.now(),
+        fav: !!v.fav,
     };
 }
 function modelToVoice(m) {
@@ -1471,6 +1473,7 @@ function buildPanel() {
         <div class="fishtts-row">
           <span>默认音色</span><select class="text_pole fishtts-grow" data-ref="defaultVoice"></select>
           <label class="checkbox_label"><input type="checkbox" data-ref="useDefault"> 未绑定的角色用默认音色</label>
+          <label class="checkbox_label"><input type="checkbox" data-ref="favOnly"> ♥ 只看收藏</label>
         </div>
         <div class="fishtts-list" data-ref="mineList"></div>
       </section>
@@ -1542,7 +1545,7 @@ function voiceOptions(selected, { narrator = false } = {}) {
     const opts = [];
     if (narrator) opts.push([NARRATOR_SAME, '和角色音色相同']);
     opts.push(['', 'Fish 默认声音']);
-    for (const v of S().voices) opts.push([v.id, v.name]);
+    for (const v of S().voices) opts.push([v.id, (v.fav ? '♥ ' : '') + v.name]);
     if (selected && !opts.some(([id]) => id === selected)) opts.push([selected, `（已删除）${String(selected).slice(0, 6)}`]);
     return opts.map(([id, name]) => `<option value="${esc(id)}"${id === selected ? ' selected' : ''}>${esc(name)}</option>`).join('');
 }
@@ -1628,9 +1631,11 @@ function renderMine() {
     const s = S();
     ref('defaultVoice').innerHTML = voiceOptions(s.defaultVoice);
     ref('useDefault').checked = !!s.useDefaultForUnbound;
+    if (ref('favOnly')) ref('favOnly').checked = !!s.favOnly;
     const usage = {};
     for (const v of Object.values(s.bindings)) usage[v] = (usage[v] || 0) + 1;
-    ref('mineList').innerHTML = s.voices.length ? s.voices.map((v) => `
+    const list = s.favOnly ? s.voices.filter((v) => v.fav) : s.voices;
+    ref('mineList').innerHTML = list.length ? list.map((v) => `
 <div class="fishtts-card">
   ${v.cover ? `<img class="fishtts-cover" src="${esc(v.cover)}" loading="lazy" alt="">` : '<div class="fishtts-cover fishtts-cover-empty"><i class="fa-solid fa-microphone"></i></div>'}
   <div class="fishtts-card-main">
@@ -1640,11 +1645,14 @@ function renderMine() {
   <div class="fishtts-card-actions">
     ${v.sample ? `<button type="button" class="menu_button" data-act="sample" data-url="${esc(v.sample)}" title="听官方样音"><i class="fa-solid fa-play"></i></button>` : ''}
     <button type="button" class="menu_button" data-act="testVoice" data-id="${esc(v.id)}" title="用试听句合成（会消耗额度）"><i class="fa-solid fa-volume-high"></i></button>
+    <button type="button" class="menu_button${v.fav ? ' fishtts-done' : ''}" data-act="toggleFav" data-id="${esc(v.id)}" title="${v.fav ? '取消收藏' : '收藏'}"><i class="fa-${v.fav ? 'solid' : 'regular'} fa-heart"></i></button>
     <button type="button" class="menu_button" data-act="setDefault" data-id="${esc(v.id)}" title="设为默认"><i class="fa-${s.defaultVoice === v.id ? 'solid' : 'regular'} fa-star"></i></button>
     <button type="button" class="menu_button" data-act="copyId" data-id="${esc(v.id)}" title="复制 ID"><i class="fa-regular fa-copy"></i></button>
     <button type="button" class="menu_button" data-act="delVoice" data-id="${esc(v.id)}" title="删除"><i class="fa-solid fa-trash-can"></i></button>
   </div>
-</div>`).join('') : '<div class="fishtts-empty">还没有音色。去「发现音色」挑几个，或者在上面粘贴音色链接。<br>没有音色时会用 Fish 默认声音朗读。</div>';
+</div>`).join('') : (s.favOnly
+    ? '<div class="fishtts-empty">没有收藏的音色。点卡片上的 ♥ 收藏喜欢的声音。</div>'
+    : '<div class="fishtts-empty">还没有音色。去「发现音色」挑几个，或者在上面粘贴音色链接。<br>没有音色时会用 Fish 默认声音朗读。</div>');
 }
 
 async function importIds() {
@@ -1806,6 +1814,11 @@ async function onPanelClick(e) {
             case 'export': exportConfig(); break;
             case 'testVoice': testVoice(id); break;
             case 'setDefault': s.defaultVoice = id; save(); renderMine(); break;
+            case 'toggleFav': {
+                const v = voiceById(id);
+                if (v) { v.fav = !v.fav; save(); renderMine(); }
+                break;
+            }
             case 'copyId':
                 await HOST.navigator.clipboard.writeText(id).then(() => toast('success', '已复制音色 ID'), () => toast('info', id));
                 break;
@@ -1876,6 +1889,8 @@ function onPanelChange(e) {
         s.defaultVoice = t.value; save(); renderMine();
     } else if (t === ref('useDefault')) {
         s.useDefaultForUnbound = t.checked; save();
+    } else if (t === ref('favOnly')) {
+        s.favOnly = t.checked; save(); renderMine();
     } else if (t === ref('narrator')) {
         s.narratorVoice = t.value; save();
     } else if (t === ref('hCurrent')) {
