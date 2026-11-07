@@ -14,7 +14,7 @@
 .fishtts-empty { padding: 24px 12px; text-align: center; opacity: .7; line-height: 1.7; }
 
 /* 消息上的朗读按钮 + 定位高亮 */
-.fishtts-mes-btn { cursor: pointer; }
+.fishtts-mes-btn, .fishtts-mes-edit { cursor: pointer; }
 .mes.fishtts-flash { animation: fishtts-flash 2.4s ease-out; }
 @keyframes fishtts-flash {
   0%, 30% { box-shadow: 0 0 0 3px var(--SmartThemeQuoteColor, #e18a24) inset; background-color: rgba(225, 138, 36, .14); }
@@ -126,6 +126,54 @@
 }
 .fishtts-hact { display: flex; gap: 6px; flex-wrap: wrap; }
 
+/* 语气标签：历史记录里的高亮、AI / 已修改标记 */
+.fishtts-tagchip {
+  display: inline; padding: 0 3px; border-radius: 4px; font-size: .9em;
+  background: rgba(74, 125, 255, .22); color: var(--SmartThemeQuoteColor, #8fb0ff);
+}
+.fishtts-chip-ai { background: rgba(168, 85, 247, .28); }
+.fishtts-chip-edit { background: rgba(34, 197, 94, .26); }
+
+/* 设置抽屉：AI 提示词、测试结果 */
+.fishtts-settings textarea.fishtts-prompt { width: 100%; resize: vertical; font-size: .9em; line-height: 1.45; }
+.fishtts-aitest {
+  margin: 4px 0 8px; padding: 6px 8px; border-radius: 8px; line-height: 1.6; white-space: pre-wrap;
+  background: rgba(127, 127, 127, .1); border: 1px dashed var(--SmartThemeBorderColor, rgba(255, 255, 255, .2));
+}
+.fishtts-aitest[hidden] { display: none; }
+
+/* 朗读稿编辑器（叠在语音面板上面） */
+.fishtts-panel.fishtts-editor { z-index: 10060; }
+.fishtts-ed-window { width: min(760px, 96vw); height: min(820px, 94vh); height: min(820px, 94dvh); }
+.fishtts-ed-note { display: block; margin: 0 0 8px; line-height: 1.5; }
+.fishtts-ed-note[hidden], .fishtts-ed-foot .checkbox_label[hidden] { display: none; }
+.fishtts-ed-tags {
+  margin-bottom: 10px; padding: 6px 8px; border-radius: 8px;
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, .12)); background: rgba(127, 127, 127, .05);
+}
+.fishtts-ed-tags summary { cursor: pointer; font-weight: 600; padding: 2px 0; }
+.fishtts-ed-group { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 6px 0; }
+.fishtts-ed-glabel { flex: 0 0 3em; font-size: .85em; opacity: .7; }
+.fishtts-ed-chip {
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, .18)); border-radius: 14px;
+  background: rgba(127, 127, 127, .1); color: inherit; cursor: pointer; padding: 2px 10px; font-size: .88em; line-height: 1.6;
+}
+.fishtts-ed-chip:hover { border-color: var(--SmartThemeQuoteColor, #4a7dff); background: rgba(74, 125, 255, .18); }
+.fishtts-ed-seg { padding: 8px; border-radius: 10px; border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, .12)); }
+.fishtts-ed-seghead { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.fishtts-ed-seghead select { flex: 1 1 auto; min-width: 0; width: auto; margin: 0; }
+.fishtts-ed-seghead .menu_button { margin: 0; width: auto; padding: 4px 8px; }
+.fishtts-ed-text { width: 100%; box-sizing: border-box; resize: vertical; min-height: 3.2em; line-height: 1.55; margin: 0; }
+.fishtts-ed-foot {
+  padding: 6px 12px 10px; padding-bottom: max(10px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, .12));
+}
+.fishtts-ed-foot .fishtts-row { margin: 4px 0; }
+.fishtts-ed-foot .checkbox_label { margin-left: auto; }
+.fishtts-ed-main { justify-content: flex-end; }
+.fishtts-ed-foot .menu_button[disabled] { opacity: .6; cursor: progress; }
+.menu_button.fishtts-primary { background: var(--SmartThemeQuoteColor, #4a7dff); color: #fff; border-color: transparent; }
+
 @media (max-width: 760px) {
   .fishtts-window { width: 100vw; height: 100vh; height: 100dvh; border-radius: 0; border: none; }
   .fishtts-head { padding: 8px; padding-top: max(8px, env(safe-area-inset-top)); }
@@ -138,4 +186,8 @@
   .fishtts-bind { flex-wrap: wrap; }
   .fishtts-bind .fishtts-name { flex-basis: 100%; }
   .fishtts-float-status { max-width: 110px; }
+  .fishtts-ed-window { width: 100vw; height: 100vh; height: 100dvh; }
+  .fishtts-ed-glabel { flex-basis: 100%; }
+  .fishtts-ed-foot .checkbox_label { margin-left: 0; flex-basis: 100%; }
+  .fishtts-ed-main .menu_button { flex: 1; justify-content: center; }
 }

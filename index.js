@@ -3,10 +3,16 @@
 // • 安装：酒馆「扩展 → 安装扩展程序」粘贴本仓库地址；也可以用酒馆助手外壳脚本加载。
 // • 合成：Fish Audio OpenAI 兼容接口（/compat/v1/audio/speech），不需要服务端插件。
 // • Key：默认存在酒馆密钥库，由酒馆后端转发；也可选浏览器直连。
+// • 语气：朗读稿里写 [happy] [whispering] 这样的 Fish S2 语气标签；可以让 AI 自动加，
+//   也可以在「朗读稿编辑器」里朗读前 / 从朗读历史里手动改。
 // ============================================================
-import { cleanText, splitText, planSegments, extractVoiceIds, hash53, parseVoiceImport } from './text.js';
+import {
+    cleanText, splitText, planSegments, extractVoiceIds, hash53, parseVoiceImport,
+    stripEmoTags, hasSpeech, listEmoTags, toSpeechInput, isS1Model, formatTagInsert,
+    DEFAULT_AI_PROMPT, buildTagRequest, parseTagResponse, planKeyOf,
+} from './text.js';
 
-const VERSION = '2.0.1';
+const VERSION = '2.1.0';
 const TAG = '[FishTTS]';
 
 // 在酒馆助手脚本（iframe）里运行时，所有界面都画在酒馆主页面上
@@ -59,7 +65,38 @@ const DEFAULTS = {
     narratorVoice: NARRATOR_SAME,
     historyLimit: 300,
     cacheMB: 80,
+    // 语气标签与 AI
+    emoEnabled: true,          // 把 [语气标签] 发给 Fish；关掉时合成前去掉所有方括号标签
+    editBeforeRead: 'off',     // off：直接读；manual：点 🎧 时先打开编辑器；always：自动朗读也先打开编辑器
+    rememberEdits: true,       // 编辑器里「记住这条消息的修改」的默认值
+    aiAuto: false,             // 朗读前自动让 AI 加语气标签
+    aiSource: 'main',          // main = 酒馆当前连接的模型；其它值 = 连接配置（Connection Profile）ID
+    aiDensity: 'normal',
+    aiContext: true,           // 把上一条消息的开头发给 AI 帮助判断情绪
+    aiPrompt: '',              // 空 = 用内置提示词
+    aiMaxTokens: 1500,
+    aiTimeout: 60,
 };
+
+// 编辑器里的标签面板：[中文名, 发给 Fish 的标签]
+const TAG_GROUPS = [
+    ['情绪', [
+        ['开心', 'happy'], ['兴奋', 'excited'], ['温柔', 'gentle'], ['平静', 'calm'], ['害羞', 'shy'],
+        ['撒娇', 'coquettish'], ['调皮', 'teasing'], ['得意', 'proud'], ['自信', 'confident'], ['好奇', 'curious'],
+        ['惊讶', 'surprised'], ['紧张', 'nervous'], ['担心', 'worried'], ['害怕', 'scared'], ['尴尬', 'embarrassed'],
+        ['委屈', 'aggrieved'], ['难过', 'sad'], ['失望', 'disappointed'], ['感动', 'moved'], ['生气', 'angry'],
+        ['不耐烦', 'impatient'], ['冷淡', 'indifferent'], ['嘲讽', 'sarcastic'], ['坚定', 'determined'],
+    ]],
+    ['语气', [
+        ['小声', 'whispering'], ['轻柔', 'soft tone'], ['低沉', 'low voice'], ['颤抖', 'trembling voice'],
+        ['慵懒', 'sleepy and lazy'], ['急促', 'in a hurry tone'], ['大喊', 'shouting'], ['尖叫', 'screaming'], ['强调', 'emphasis'],
+    ]],
+    ['声音', [
+        ['大笑', 'laughing'], ['轻笑', 'chuckling'], ['叹气', 'sighing'], ['抽泣', 'sobbing'], ['大哭', 'crying loudly'],
+        ['喘气', 'panting'], ['倒吸气', 'gasping'], ['哼', 'humph'], ['打哈欠', 'yawning'], ['清嗓子', 'clear throat'],
+    ]],
+    ['停顿', [['短停顿', 'break'], ['长停顿', 'long-break']]],
+];
 
 // ---------------------------------------------------------------- 通用工具
 
@@ -147,16 +184,23 @@ let dbPromise = null;
 function db() {
     if (!dbPromise) {
         dbPromise = new Promise((resolve, reject) => {
-            const req = HOST.indexedDB.open('fish-tts', 1);
+            const req = HOST.indexedDB.open('fish-tts', 2);
             req.onupgradeneeded = () => {
                 const d = req.result;
                 if (!d.objectStoreNames.contains('history')) d.createObjectStore('history', { keyPath: 'id' });
                 if (!d.objectStoreNames.contains('audio')) d.createObjectStore('audio', { keyPath: 'key' });
                 if (!d.objectStoreNames.contains('audioMeta')) d.createObjectStore('audioMeta', { keyPath: 'key' });
+                // v2：每条消息的朗读稿（AI 加的标签 / 手动修改），键 = 原始朗读稿指纹
+                if (!d.objectStoreNames.contains('scripts')) d.createObjectStore('scripts', { keyPath: 'key' });
             };
-            req.onsuccess = () => resolve(req.result);
+            req.onsuccess = () => {
+                const d = req.result;
+                // 别的标签页升级数据库时让出连接，下次用到时重新打开
+                d.onversionchange = () => { d.close(); dbPromise = null; };
+                resolve(d);
+            };
             req.onerror = () => reject(req.error);
-            req.onblocked = () => reject(new Error('IndexedDB 被占用'));
+            req.onblocked = () => reject(new Error('IndexedDB 被旧版本占用：请关闭其它打开着酒馆的标签页后刷新'));
         });
         dbPromise.catch(() => { dbPromise = null; });
     }
@@ -234,6 +278,29 @@ async function addHistory(rec) {
     }
 }
 
+// 朗读稿：{ key, source: 'ai'|'manual', texts?: string[], segments?: {voiceId, text}[], ts }
+// ai 只记文字（音色跟着当前绑定走）；manual 连音色、增删的段落一起记。
+const SCRIPT_LIMIT = 2000;
+async function scriptGet(key) {
+    if (!key) return null;
+    try { return (await idb.get('scripts', key)) || null; } catch { return null; }
+}
+async function scriptPut(rec) {
+    try {
+        await idb.put('scripts', { ...rec, ts: Date.now() });
+        const all = await idb.all('scripts');
+        if (all.length > SCRIPT_LIMIT) {
+            all.sort((a, b) => a.ts - b.ts);
+            for (const r of all.slice(0, all.length - SCRIPT_LIMIT)) await idb.del('scripts', r.key);
+        }
+    } catch (e) {
+        console.warn(TAG, '保存朗读稿失败', e);
+    }
+}
+async function scriptDel(key) {
+    try { await idb.del('scripts', key); } catch { /* 忽略 */ }
+}
+
 // ---------------------------------------------------------------- Fish Audio 接口
 
 const currentModel = () => {
@@ -296,7 +363,9 @@ function explainError(status, text) {
 
 async function synthesize(seg, signal) {
     const s = S();
-    const body = { model: seg.model, input: seg.text, voice: seg.voiceId || '', response_format: 'mp3', speed: seg.speed };
+    // seg.input 是真正发给 Fish 的文字（S1 已转成圆括号、关掉语气标签时已去掉标签）；v2.0.x 的历史记录没有这个字段
+    const input = seg.input ?? speechInput(seg.text, seg.model);
+    const body = { model: seg.model, input, voice: seg.voiceId || '', response_format: 'mp3', speed: seg.speed };
     let r;
     if (s.keyMode === 'direct') {
         if (!s.directKey) throw new Error('还没填写 API Key（浏览器直连模式）');
@@ -358,11 +427,29 @@ function resolveVoice(name) {
     if (Object.prototype.hasOwnProperty.call(s.bindings, name)) return s.bindings[name];
     return s.useDefaultForUnbound ? s.defaultVoice : null;
 }
+/** 编辑稿 → 发给 Fish 的文字（S1 转圆括号；关掉语气标签时去掉标签） */
+const speechInput = (text, model) => toSpeechInput(text, { model, emoEnabled: S().emoEnabled !== false });
+
 function makeSeg(text, voiceId) {
     const model = currentModel();
     const speed = Math.min(2, Math.max(0.5, Number(S().speed) || 1));
-    return { text, voiceId, model, speed, key: hash53(`${model}|${voiceId}|${speed}|${text}`) };
+    const input = speechInput(text, model);
+    // 没有标签时 input 和 text 相同，缓存键和 v2.0.x 一致，旧缓存还能用
+    return { text, input, voiceId, model, speed, key: hash53(`${model}|${voiceId}|${speed}|${input}`) };
 }
+
+/** 把段落写进历史记录的展示字段 */
+function fillRecord(rec, segments, tagSource) {
+    if (!rec) return rec;
+    rec.segments = segments;
+    rec.text = segments.map((x) => x.text).join('\n').slice(0, 3000);
+    rec.voices = [...new Set(segments.map((x) => voiceName(x.voiceId)))];
+    rec.tagSource = tagSource || '';
+    return rec;
+}
+
+const sameItems = (a, b) => a.length === b.length
+    && a.every((x, i) => String(x.voiceId ?? '') === String(b[i].voiceId ?? '') && String(x.text).trim() === String(b[i].text).trim());
 
 function currentChatInfo() {
     const c = ctx();
@@ -399,22 +486,28 @@ function buildMessageJob(mesId, manual) {
     if (msg.is_system) { say('info', '系统消息不朗读'); return null; }
 
     const text = cleanText(msg.mes, { stripTags: s.stripTags, skipAsterisk: s.skipAsterisk });
-    if (!text) { say('info', '这条消息过滤后没有可朗读的文字'); return null; }
+    if (!text || !hasSpeech(text)) { say('info', '这条消息过滤后没有可朗读的文字'); return null; }
 
     const charVoice = resolveVoice(msg.name);
     const narratorVoice = s.narratorVoice === NARRATOR_SAME ? charVoice : s.narratorVoice;
-    const segments = planSegments(splitText(text, s.readMode), { charVoice, narratorVoice, maxChars: s.maxChars })
-        .map((p) => makeSeg(p.text, p.voiceId));
-    if (!segments.length) {
+    const plan = planSegments(splitText(text, s.readMode), { charVoice, narratorVoice, maxChars: s.maxChars });
+    if (!plan.length) {
         say('warning', `「${msg.name}」没有绑定音色，也没有开启「未绑定的角色用默认音色」`);
         return null;
     }
 
+    const orig = plan.map((p) => ({ voiceId: p.voiceId, text: p.text }));
+    const planKey = planKeyOf(orig);
+    const segments = orig.map((p) => makeSeg(p.text, p.voiceId));
     const chat = currentChatInfo();
-    return {
+    const job = {
         label: msg.name,
+        speaker: msg.name,
+        planKey,
+        orig,
+        context: s.aiContext ? previousContext(mesId) : '',
         segments,
-        record: {
+        record: fillRecord({
             id: uuid(),
             ts: Date.now(),
             chatId: c.getCurrentChatId(),
@@ -425,11 +518,124 @@ function buildMessageJob(mesId, manual) {
             probe: norm(msg.mes).slice(0, 60),
             name: msg.name,
             isUser: !!msg.is_user,
-            text: segments.map((x) => x.text).join('\n').slice(0, 3000),
-            voices: [...new Set(segments.map((x) => voiceName(x.voiceId)))],
-            segments,
-        },
+            planKey,
+            orig,
+        }, segments, ''),
     };
+    // 播放前（排到它时）再套用保存的朗读稿 / 调 AI，保证队列顺序不乱
+    job.prepare = () => applyScript(job, { allowAi: !!S().aiAuto });
+    return job;
+}
+
+/** 上一条消息的开头，给 AI 判断情绪用 */
+function previousContext(mesId) {
+    const chat = ctx().chat || [];
+    for (let i = Number(mesId) - 1; i >= 0 && i >= mesId - 5; i--) {
+        const m = chat[i];
+        if (!m || m.is_system) continue;
+        const t = cleanText(m.mes, { stripTags: S().stripTags, skipAsterisk: false });
+        if (t) return `${m.name}：${t.slice(0, 300)}`;
+    }
+    return '';
+}
+
+function setJobItems(job, items, source) {
+    job.segments = items.filter((x) => hasSpeech(x.text)).map((x) => makeSeg(x.text, x.voiceId));
+    fillRecord(job.record, job.segments, source);
+}
+
+/** 读出这条消息保存过的朗读稿；ai 稿段数和原稿对不上（比如改了朗读模式）就不用 */
+async function loadScript(planKey, orig) {
+    const sc = await scriptGet(planKey);
+    if (!sc) return null;
+    if (sc.source === 'manual' && Array.isArray(sc.segments) && sc.segments.length) {
+        return { source: 'manual', items: sc.segments.map((x) => ({ voiceId: String(x.voiceId ?? ''), text: String(x.text ?? '') })) };
+    }
+    if (sc.source === 'ai' && Array.isArray(sc.texts) && sc.texts.length === orig.length) {
+        return { source: 'ai', items: orig.map((o, i) => ({ voiceId: o.voiceId, text: String(sc.texts[i] ?? o.text) })) };
+    }
+    return null;
+}
+
+let aiWarnAt = 0;
+async function applyScript(job, { allowAi }) {
+    if (!job.planKey) return;
+    const saved = await loadScript(job.planKey, job.orig);
+    if (saved) { setJobItems(job, saved.items, saved.source); return; }
+    if (!allowAi) return;
+    setStatus(`${job.label} AI 加语气标签中…`);
+    try {
+        const res = await aiTag(job.orig.map((o) => o.text), { speaker: job.speaker, context: job.context });
+        setJobItems(job, job.orig.map((o, i) => ({ voiceId: o.voiceId, text: res.texts[i] })), res.tagged ? 'ai' : '');
+        scriptPut({ key: job.planKey, source: 'ai', texts: res.texts });
+        if (res.rejected) console.warn(TAG, `AI 改动了 ${res.rejected} 段原文，这些段按原文朗读`);
+    } catch (e) {
+        console.warn(TAG, 'AI 加语气标签失败，按原文朗读', e);
+        if (Date.now() - aiWarnAt > 60000) {
+            aiWarnAt = Date.now();
+            toast('warning', `AI 加语气标签失败，这次按原文朗读：${e.message}`);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- AI 加语气标签
+
+function connectionProfiles() {
+    const list = ctx().extensionSettings?.connectionManager?.profiles;
+    return Array.isArray(list) ? list.filter((p) => p && p.id) : [];
+}
+
+function aiSourceOptions(selected) {
+    const opts = [['main', '酒馆当前连接的模型']];
+    for (const p of connectionProfiles()) opts.push([p.id, `连接配置：${p.name || p.id}`]);
+    if (selected && !opts.some(([id]) => id === selected)) opts.push([selected, '（已删除的连接配置）']);
+    return opts.map(([id, name]) => `<option value="${esc(id)}"${id === selected ? ' selected' : ''}>${esc(name)}</option>`).join('');
+}
+
+async function aiGenerate(system, user) {
+    const s = S();
+    const c = ctx();
+    const maxTokens = Math.max(200, Number(s.aiMaxTokens) || DEFAULTS.aiMaxTokens);
+    if (s.aiSource && s.aiSource !== 'main') {
+        const svc = c.ConnectionManagerRequestService;
+        if (!svc?.sendRequest) throw new Error('当前酒馆版本不支持按连接配置调用，请把「AI 使用的模型」改成「酒馆当前连接的模型」');
+        if (!connectionProfiles().some((p) => p.id === s.aiSource)) throw new Error('选择的连接配置已经不存在，请在扩展设置里重新选择');
+        const messages = [{ role: 'system', content: system }, { role: 'user', content: user }];
+        const r = await svc.sendRequest(s.aiSource, messages, maxTokens, { stream: false, extractData: true, includePreset: true, includeInstruct: true });
+        return typeof r === 'string' ? r : String(r?.content ?? r?.text ?? '');
+    }
+    if (typeof c.generateRaw !== 'function') throw new Error('当前酒馆版本没有 generateRaw，无法调用 AI');
+    // 新版酒馆的 generateRaw 收一个对象参数（函数 length 为 0）；旧版收位置参数
+    const out = c.generateRaw.length === 0
+        ? await c.generateRaw({ prompt: user, systemPrompt: system, responseLength: maxTokens, trimNames: false })
+        : await c.generateRaw(user, null, false, false, system, maxTokens);
+    return String(out ?? '');
+}
+
+function withTimeout(promise, ms, message) {
+    let timer = 0;
+    return Promise.race([
+        promise.finally(() => clearTimeout(timer)),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); }),
+    ]);
+}
+
+/**
+ * 让 AI 给每段朗读稿加语气标签。AI 改动了原文的段落保持原样。
+ * @returns {Promise<{texts: string[], tagged: number, rejected: number}>}
+ */
+async function aiTag(texts, { speaker = '', context = '' } = {}) {
+    const s = S();
+    const system = String(s.aiPrompt || '').trim() || DEFAULT_AI_PROMPT;
+    const user = buildTagRequest(texts, { speaker, density: s.aiDensity, context });
+    const sec = Math.min(300, Math.max(10, Number(s.aiTimeout) || DEFAULTS.aiTimeout));
+    const out = await withTimeout(aiGenerate(system, user), sec * 1000, `AI 超过 ${sec} 秒没有回复`);
+    const res = parseTagResponse(out, texts);
+    if (res.rejected === texts.length) {
+        console.warn(TAG, 'AI 回复无法使用：', out);
+        throw new Error('AI 的回复改动了原文或格式不对，已忽略（可以换个模型，或在设置里调整提示词）');
+    }
+    return res;
 }
 
 // ---------------------------------------------------------------- 播放队列
@@ -517,6 +723,11 @@ function playBlob(blob, signal) {
 
 async function playJob(job) {
     const signal = job.ctrl.signal;
+    if (job.prepare) {
+        await job.prepare(signal);
+        if (signal.aborted) throw new DOMException('已停止', 'AbortError');
+    }
+    if (!job.segments.length) return;
     const pending = [];
     const fetchSeg = (i) => (pending[i] ??= obtainAudio(job.segments[i], signal));
     for (let i = 0; i < job.segments.length; i++) {
@@ -568,8 +779,23 @@ function onMessageReceived(mesId, type) {
     if (type === 'first_message' && !s.readGreeting) return;
     const msg = ctx().chat?.[mesId];
     if (!msg || msg.is_user || msg.is_system) return;
+    // 「自动朗读也先打开编辑器」：编辑器空着才弹；正在编辑别的消息时这条照常排队朗读
+    if (s.editBeforeRead === 'always' && edEl && !isEditorOpen()) {
+        openEditorForMessage(Number(mesId), { auto: true }).catch((e) => console.error(TAG, e));
+        return;
+    }
     const job = buildMessageJob(Number(mesId), false);
     if (job) enqueue(job);
+}
+
+/** 消息上的 🎧：按设置直接朗读或先打开编辑器 */
+function readMessage(mesId) {
+    if (S().editBeforeRead !== 'off' && edEl) {
+        openEditorForMessage(mesId).catch((e) => toast('error', e.message));
+        return;
+    }
+    const job = buildMessageJob(mesId, true);
+    if (job) playNow(job);
 }
 
 let decorateTimer = 0;
@@ -580,12 +806,17 @@ function decorateSoon() {
 function decorateMessages() {
     const s = S();
     if (!s.enabled || !s.showMesButton) {
-        doc.querySelectorAll('.fishtts-mes-btn').forEach((b) => b.remove());
+        doc.querySelectorAll('.fishtts-mes-btn, .fishtts-mes-edit').forEach((b) => b.remove());
         return;
     }
     doc.querySelectorAll('#chat .mes').forEach((mes) => {
         const box = mes.querySelector('.extraMesButtons');
         if (!box || box.querySelector('.fishtts-mes-btn')) return;
+        const edit = doc.createElement('div');
+        edit.className = 'mes_button fishtts-mes-edit fa-solid fa-pen-to-square interactable';
+        edit.title = 'Fish：编辑语气标签后朗读';
+        edit.tabIndex = 0;
+        box.prepend(edit);
         const b = doc.createElement('div');
         b.className = 'mes_button fishtts-mes-btn fa-solid fa-headphones interactable';
         b.title = 'Fish 朗读这条';
@@ -782,6 +1013,303 @@ function updateFloat() {
     else defaultFloatPosition();
 }
 
+// ---------------------------------------------------------------- 朗读稿编辑器（朗读前 / 历史记录里改语气标签）
+
+let edEl = null;
+const ed = { ctx: null, lastTa: null, busy: false, token: 0, touched: false, aiApplied: false };
+const eref = (name) => edEl.querySelector(`[data-ref="${name}"]`);
+const isEditorOpen = () => !!edEl && !edEl.classList.contains('fishtts-hidden');
+
+function buildEditor() {
+    const groups = TAG_GROUPS.map(([label, tags]) => `
+      <div class="fishtts-ed-group"><span class="fishtts-ed-glabel">${esc(label)}</span>${tags.map(([zh, tag]) => `<button type="button" class="fishtts-ed-chip" data-act="edTag" data-tag="${esc(tag)}" title="[${esc(tag)}]">${esc(zh)}</button>`).join('')}</div>`).join('');
+    edEl = mount(el(`
+<div id="fishtts-editor" class="fishtts-panel fishtts-editor fishtts-hidden" role="dialog" aria-label="Fish 朗读稿编辑器">
+  <div class="fishtts-backdrop" data-act="edClose"></div>
+  <div class="fishtts-window fishtts-ed-window">
+    <div class="fishtts-head">
+      <div class="fishtts-title"><i class="fa-solid fa-pen-to-square"></i> 朗读稿 <small data-ref="edTitle"></small></div>
+      <button type="button" class="fishtts-icon" data-act="edClose" title="关闭"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="fishtts-body">
+      <small class="fishtts-dim fishtts-ed-note" data-ref="edNote"></small>
+      <details class="fishtts-ed-tags" open>
+        <summary>语气标签 <span class="fishtts-dim">（先点到要加标签的位置，再点下面的标签插入）</span></summary>
+        ${groups}
+        <div class="fishtts-row">
+          <input class="text_pole fishtts-grow" data-ref="edCustom" placeholder="自定义标签，例如 softly, teasing 或 voice breaking">
+          <button type="button" class="menu_button" data-act="edTagCustom"><i class="fa-solid fa-plus"></i> 插入</button>
+        </div>
+      </details>
+      <div class="fishtts-list" data-ref="edSegs"></div>
+      <div class="fishtts-row"><button type="button" class="menu_button" data-act="edAdd"><i class="fa-solid fa-plus"></i> 添加一段</button></div>
+    </div>
+    <div class="fishtts-ed-foot">
+      <div class="fishtts-row">
+        <button type="button" class="menu_button" data-act="edAi" title="让 AI 在原文里插入语气标签，不改动文字（已有标签会保留）"><i class="fa-solid fa-wand-magic-sparkles"></i> <span>AI 加标签</span></button>
+        <button type="button" class="menu_button" data-act="edClear" title="去掉所有 [标签]"><i class="fa-solid fa-eraser"></i> 清除标签</button>
+        <button type="button" class="menu_button" data-act="edReset" title="回到消息原文"><i class="fa-solid fa-rotate-left"></i> 还原原文</button>
+        <label class="checkbox_label" data-ref="edRememberBox"><input type="checkbox" data-ref="edRemember"> 记住这条消息的修改</label>
+      </div>
+      <div class="fishtts-row fishtts-ed-main">
+        <button type="button" class="menu_button" data-act="edClose">取消</button>
+        <button type="button" class="menu_button" data-act="edSave"><i class="fa-solid fa-floppy-disk"></i> 只保存</button>
+        <button type="button" class="menu_button fishtts-primary" data-act="edPlay"><i class="fa-solid fa-play"></i> 朗读</button>
+      </div>
+    </div>
+  </div>
+</div>`), doc.body);
+
+    edEl.addEventListener('click', onEditorClick);
+    edEl.addEventListener('focusin', (e) => { if (e.target.classList?.contains('fishtts-ed-text')) ed.lastTa = e.target; });
+    edEl.addEventListener('input', (e) => { if (e.target.classList?.contains('fishtts-ed-text')) ed.touched = true; });
+    edEl.addEventListener('change', (e) => { if (e.target.classList?.contains('fishtts-ed-voice')) ed.touched = true; });
+    eref('edCustom').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); insertCustomTag(); }
+    });
+}
+
+function renderEdSegs(items) {
+    eref('edSegs').innerHTML = items.map((x, i) => `
+<div class="fishtts-ed-seg">
+  <div class="fishtts-ed-seghead">
+    <span class="fishtts-chip" data-ref="segNo">第 ${i + 1} 段</span>
+    <select class="text_pole fishtts-ed-voice" title="这一段用的音色">${voiceOptions(String(x.voiceId ?? ''))}</select>
+    <button type="button" class="menu_button" data-act="edPreview" title="只试听这一段（会消耗额度）"><i class="fa-solid fa-volume-high"></i></button>
+    <button type="button" class="menu_button" data-act="edDel" title="删除这一段（不朗读）"><i class="fa-solid fa-trash-can"></i></button>
+  </div>
+  <textarea class="text_pole fishtts-ed-text" rows="${Math.min(10, Math.max(2, Math.ceil(String(x.text).length / 42)))}">${esc(x.text)}</textarea>
+</div>`).join('') || '<div class="fishtts-empty">没有段落了，点「添加一段」。</div>';
+    ed.lastTa = null;
+}
+
+function renumberEdSegs() {
+    edEl.querySelectorAll('.fishtts-ed-seg').forEach((row, i) => { row.querySelector('[data-ref="segNo"]').textContent = `第 ${i + 1} 段`; });
+    if (!edEl.querySelector('.fishtts-ed-seg')) renderEdSegs([]);
+}
+
+function edItems() {
+    return [...edEl.querySelectorAll('.fishtts-ed-seg')].map((row) => ({
+        voiceId: row.querySelector('.fishtts-ed-voice').value,
+        text: row.querySelector('.fishtts-ed-text').value.trim(),
+    }));
+}
+
+/**
+ * @param {{title: string, speaker: string, context?: string, planKey?: string, orig: {voiceId: string, text: string}[],
+ *          items: {voiceId: string, text: string}[], record?: object|null, fromHistory?: boolean, note?: string,
+ *          loadedSource?: string, autoAi?: boolean}} opts
+ */
+function openEditor(opts) {
+    if (!edEl) { toast('error', '编辑器没有初始化成功，请刷新页面'); return; }
+    ed.ctx = opts;
+    ed.token++;
+    ed.touched = false;
+    ed.aiApplied = false;
+    eref('edTitle').textContent = opts.title || '';
+    const notes = [];
+    if (opts.note) notes.push(opts.note);
+    if (opts.fromHistory) notes.push('改完点「朗读」会重新合成并更新这条历史记录。');
+    if (S().emoEnabled === false) notes.push('提示：设置里关掉了「把语气标签发给 Fish」，合成前会去掉所有标签。');
+    else if (isS1Model(currentModel())) notes.push('当前模型是 S1：合成时会把 [标签] 自动换成 (标签)，S1 只认官方固定标签，自然语言描述可能无效。');
+    eref('edNote').textContent = notes.join(' ');
+    eref('edNote').hidden = !notes.length;
+    eref('edRemember').checked = !!S().rememberEdits;
+    eref('edRememberBox').hidden = !opts.planKey;
+    renderEdSegs(opts.items);
+    setEdBusy(false);
+    edEl.classList.remove('fishtts-hidden');
+    if (opts.autoAi) runEditorAi();
+}
+
+async function closeEditor(force = false) {
+    if (!isEditorOpen()) return;
+    if (!force && ed.touched && !(await confirmBox('放弃这次修改？'))) return;
+    edEl.classList.add('fishtts-hidden');
+    ed.token++;
+    ed.ctx = null;
+}
+
+async function openEditorForMessage(mesId, { auto = false } = {}) {
+    const job = buildMessageJob(Number(mesId), !auto);
+    if (!job) return;
+    const saved = await loadScript(job.planKey, job.orig);
+    if (auto && isEditorOpen()) { enqueue(job); return; } // 等待期间用户已经打开了别的编辑
+    openEditor({
+        title: `${job.label} · #${mesId}`,
+        speaker: job.speaker,
+        context: job.context,
+        planKey: job.planKey,
+        orig: job.orig,
+        items: saved?.items || job.orig,
+        loadedSource: saved?.source || '',
+        record: job.record,
+        fromHistory: false,
+        note: saved ? (saved.source === 'manual' ? '已载入你上次保存的修改。' : '已载入上次 AI 加的标签。') : (auto ? '新回复：确认后点「朗读」。' : ''),
+        autoAi: !saved && !!S().aiAuto,
+    });
+}
+
+function openEditorForRecord(rec) {
+    const segs = Array.isArray(rec.segments) ? rec.segments : [];
+    // v2.0.x 的记录没有 orig：那时还不能编辑，记录里的稿子就是原文
+    const orig = Array.isArray(rec.orig) && rec.orig.length ? rec.orig : segs.map((x) => ({ voiceId: String(x.voiceId ?? ''), text: String(x.text ?? '') }));
+    const planKey = rec.planKey || planKeyOf(orig);
+    openEditor({
+        title: `${rec.name} · 历史记录 #${rec.mesId}`,
+        speaker: rec.name,
+        context: '',
+        planKey,
+        orig,
+        items: segs.map((x) => ({ voiceId: String(x.voiceId ?? ''), text: String(x.text ?? '') })),
+        loadedSource: rec.tagSource || '',
+        record: { ...rec, planKey, orig },
+        fromHistory: true,
+    });
+}
+
+function setEdBusy(busy, label) {
+    const b = edEl.querySelector('[data-act="edAi"]');
+    b.disabled = busy;
+    b.querySelector('span').textContent = busy ? (label || 'AI 处理中…') : 'AI 加标签';
+    b.querySelector('i').className = busy ? 'fa-solid fa-spinner fa-spin' : 'fa-solid fa-wand-magic-sparkles';
+}
+
+async function runEditorAi() {
+    if (ed.busy) return;
+    const items = edItems();
+    if (!items.some((x) => hasSpeech(x.text))) { toast('info', '没有可以加标签的文字'); return; }
+    const token = ed.token;
+    ed.busy = true;
+    setEdBusy(true, 'AI 加标签中…');
+    try {
+        const res = await aiTag(items.map((x) => x.text), { speaker: ed.ctx?.speaker, context: ed.ctx?.context });
+        if (token !== ed.token || !isEditorOpen()) return; // 编辑器已经关了或换了一条
+        edEl.querySelectorAll('.fishtts-ed-text').forEach((ta, i) => { if (res.texts[i] !== undefined) ta.value = res.texts[i]; });
+        ed.aiApplied = true;
+        if (res.rejected) toast('warning', `AI 加好了标签；有 ${res.rejected} 段 AI 改动了原文，这几段保持原样`);
+        else if (!res.tagged) toast('info', 'AI 觉得这段不需要加标签');
+        else toast('success', 'AI 已加好语气标签，可以再手动调整');
+    } catch (e) {
+        if (token === ed.token) toast('error', `AI 加标签失败：${e.message}`);
+    } finally {
+        ed.busy = false;
+        if (edEl) setEdBusy(false);
+    }
+}
+
+function insertTag(tag) {
+    let ta = ed.lastTa;
+    if (!ta || !ta.isConnected) ta = edEl.querySelector('.fishtts-ed-text');
+    if (!ta) return;
+    const start = ta.selectionStart ?? ta.value.length;
+    const end = ta.selectionEnd ?? start;
+    const text = formatTagInsert(tag, ta.value.slice(0, start), ta.value.slice(end));
+    if (!text) return;
+    ta.focus();
+    if (typeof ta.setRangeText === 'function') ta.setRangeText(text, start, end, 'end');
+    else ta.value = ta.value.slice(0, start) + text + ta.value.slice(end);
+    ed.lastTa = ta;
+    ed.touched = true;
+}
+
+function insertCustomTag() {
+    const input = eref('edCustom');
+    const tag = input.value.replace(/[[\]\n]/g, ' ').trim().slice(0, 40);
+    if (!tag) { toast('info', '先输入标签内容，例如 softly'); return; }
+    insertTag(tag);
+    input.value = '';
+}
+
+/** 编辑器里的修改：落到朗读稿库 / 历史记录，按需朗读 */
+async function commitEditor({ play }) {
+    const c = ed.ctx;
+    if (!c) return;
+    const items = edItems().filter((x) => hasSpeech(x.text));
+    if (!items.length) { toast('warning', '没有可以朗读的文字'); return; }
+    const remember = !!c.planKey && eref('edRemember').checked;
+    const changed = !sameItems(items, c.orig);
+    const source = !changed ? '' : (ed.touched ? 'manual' : (ed.aiApplied ? 'ai' : (c.loadedSource || 'manual')));
+
+    if (!play && !remember && !c.fromHistory) {
+        toast('warning', '没有勾选「记住这条消息的修改」，只保存的话什么都不会留下。要么勾上，要么直接点「朗读」');
+        return;
+    }
+    if (remember) {
+        if (!changed) await scriptDel(c.planKey);
+        else if (source === 'ai' && items.length === c.orig.length && items.every((x, i) => x.voiceId === String(c.orig[i].voiceId ?? ''))) {
+            await scriptPut({ key: c.planKey, source: 'ai', texts: items.map((x) => x.text) });
+        } else {
+            await scriptPut({ key: c.planKey, source: 'manual', segments: items });
+        }
+    }
+
+    const segments = items.map((x) => makeSeg(x.text, x.voiceId));
+    const rec = c.record ? fillRecord({ ...c.record, editedAt: changed ? Date.now() : c.record.editedAt }, segments, source) : null;
+    if (rec && !c.fromHistory) rec.ts = Date.now();
+    await closeEditor(true);
+
+    if (play) {
+        playNow({ label: c.speaker || '朗读', segments, record: rec });
+    } else if (rec && c.fromHistory) {
+        await idb.put('history', rec);
+        if (isPanelOpen() && ui.tab === 'history') renderHistory();
+        toast('success', remember ? '已更新历史记录，下次朗读这条消息也会用这份稿子（重播时才会重新合成）' : '已更新历史记录（重播时才会重新合成）');
+    } else {
+        toast('success', '已保存。下次朗读这条消息会使用修改后的稿子');
+    }
+}
+
+async function onEditorClick(e) {
+    const btn = e.target.closest('[data-act]');
+    if (!btn || !edEl.contains(btn)) return;
+    const act = btn.dataset.act;
+    try {
+        switch (act) {
+            case 'edClose': await closeEditor(); break;
+            case 'edTag': insertTag(btn.dataset.tag); break;
+            case 'edTagCustom': insertCustomTag(); break;
+            case 'edAi': await runEditorAi(); break;
+            case 'edClear':
+                edEl.querySelectorAll('.fishtts-ed-text').forEach((ta) => { ta.value = stripEmoTags(ta.value); });
+                ed.touched = true;
+                break;
+            case 'edReset':
+                renderEdSegs(ed.ctx?.orig || []);
+                ed.touched = false;
+                ed.aiApplied = false;
+                break;
+            case 'edAdd': {
+                const items = edItems();
+                const voiceId = items.length ? items[items.length - 1].voiceId : (resolveVoice(ed.ctx?.speaker) ?? S().defaultVoice);
+                renderEdSegs([...items, { voiceId, text: '' }]);
+                const all = edEl.querySelectorAll('.fishtts-ed-text');
+                all[all.length - 1]?.focus();
+                ed.touched = true;
+                break;
+            }
+            case 'edDel':
+                btn.closest('.fishtts-ed-seg')?.remove();
+                renumberEdSegs();
+                ed.touched = true;
+                break;
+            case 'edPreview': {
+                const row = btn.closest('.fishtts-ed-seg');
+                const text = row.querySelector('.fishtts-ed-text').value.trim();
+                if (!hasSpeech(text)) { toast('info', '这一段没有可以读的文字'); break; }
+                playNow({ label: '试听这一段', segments: [makeSeg(text, row.querySelector('.fishtts-ed-voice').value)], record: null });
+                break;
+            }
+            case 'edSave': await commitEditor({ play: false }); break;
+            case 'edPlay': await commitEditor({ play: true }); break;
+            default: break;
+        }
+    } catch (err) {
+        console.error(TAG, err);
+        toast('error', err.message || String(err));
+    }
+}
+
 // ---------------------------------------------------------------- 语音面板
 
 const ui = { tab: 'discover', results: [], page: 1, hasMore: false, searching: false, historyShown: 100 };
@@ -841,7 +1369,7 @@ function buildPanel() {
       </section>
 
       <section data-pane="bind">
-        <small class="fishtts-dim">角色名要和聊天里显示的名字完全一致。也可以给你自己的人设名绑定音色，用消息上的 <i class="fa-solid fa-headphones"></i> 手动朗读。</small>
+        <small class="fishtts-dim">角色名要和聊天里显示的名字完全一致。也可以给你自己的人设名绑定音色，用消息上的 <i class="fa-solid fa-headphones"></i> 手动朗读，或点 <i class="fa-solid fa-pen-to-square"></i> 先加语气标签再读。</small>
         <div class="fishtts-row">
           <input class="text_pole fishtts-grow" data-ref="bindName" list="fishtts-names" placeholder="角色名">
           <datalist id="fishtts-names"></datalist>
@@ -877,7 +1405,11 @@ function buildPanel() {
     let hTimer = 0;
     ref('hq').addEventListener('input', () => { clearTimeout(hTimer); hTimer = setTimeout(() => { ui.historyShown = 100; renderHistory(); }, 200); });
     ref('file').addEventListener('change', onImportFile);
-    onHost(doc, 'keydown', (e) => { if (e.key === 'Escape' && isPanelOpen()) closePanel(); });
+    onHost(doc, 'keydown', (e) => {
+        if (e.key !== 'Escape') return;
+        if (isEditorOpen()) closeEditor();
+        else if (isPanelOpen()) closePanel();
+    });
 }
 
 function openPanel(tab) {
@@ -1122,16 +1654,24 @@ async function renderHistory() {
   <div class="fishtts-hhead">
     <b>${esc(r.name)}</b>
     <span class="fishtts-chip">${esc((r.voices || []).join(' / '))}</span>
+    ${r.tagSource === 'ai' ? '<span class="fishtts-chip fishtts-chip-ai" title="语气标签由 AI 添加">AI 标签</span>' : ''}
+    ${r.tagSource === 'manual' ? '<span class="fishtts-chip fishtts-chip-edit" title="朗读稿被手动修改过">已修改</span>' : ''}
     <span class="fishtts-dim">${fmtTime(r.ts)} · ${esc(r.chatLabel || '')} · #${r.mesId}</span>
   </div>
-  <div class="fishtts-htext">${esc(r.text)}</div>
+  <div class="fishtts-htext">${highlightTags(r.text)}</div>
   <div class="fishtts-hact">
     <button type="button" class="menu_button" data-act="hPlay" data-id="${esc(r.id)}"><i class="fa-solid fa-play"></i> 重播</button>
+    <button type="button" class="menu_button" data-act="hEdit" data-id="${esc(r.id)}" title="修改语气标签 / 文字后重新朗读"><i class="fa-solid fa-pen-to-square"></i> 编辑</button>
     <button type="button" class="menu_button" data-act="hLocate" data-id="${esc(r.id)}"><i class="fa-solid fa-location-crosshairs"></i> 定位</button>
     <button type="button" class="menu_button" data-act="hDel" data-id="${esc(r.id)}" title="删除这条记录"><i class="fa-solid fa-trash-can"></i></button>
   </div>
 </div>`).join('') : `<div class="fishtts-empty">${total ? '没有符合条件的记录' : '还没有朗读记录'}</div>`;
     panelEl.querySelector('[data-act="hMore"]').hidden = list.length <= ui.historyShown;
+}
+
+/** 转义后把 [标签] 高亮成小标签 */
+function highlightTags(text) {
+    return esc(text).replace(/\[([^[\]\n]{1,40})\]/g, '<span class="fishtts-tagchip">[$1]</span>');
 }
 
 // ---- 面板事件
@@ -1196,6 +1736,12 @@ async function onPanelClick(e) {
                 if (rec) playNow({ label: `重播 ${rec.name}`, segments: rec.segments, record: null });
                 break;
             }
+            case 'hEdit': {
+                const rec = await idb.get('history', id);
+                if (rec) openEditorForRecord(rec);
+                else toast('warning', '这条记录已经被删除');
+                break;
+            }
             case 'hLocate': {
                 const rec = await idb.get('history', id);
                 if (rec) await locate(rec);
@@ -1252,7 +1798,7 @@ function buildSettings(container) {
       <label class="checkbox_label"><input type="checkbox" data-setting="enabled"> 启用</label>
       <label class="checkbox_label"><input type="checkbox" data-setting="autoRead"> 自动朗读角色的新回复</label>
       <label class="checkbox_label"><input type="checkbox" data-setting="readGreeting"> 朗读开场白</label>
-      <label class="checkbox_label"><input type="checkbox" data-setting="showMesButton"> 在消息菜单里显示 <i class="fa-solid fa-headphones"></i> 朗读按钮</label>
+      <label class="checkbox_label"><input type="checkbox" data-setting="showMesButton"> 在消息菜单里显示 <i class="fa-solid fa-headphones"></i> 朗读 和 <i class="fa-solid fa-pen-to-square"></i> 编辑按钮</label>
       <label class="checkbox_label"><input type="checkbox" data-setting="showFloat"> 显示悬浮控制条</label>
       <div class="fishtts-row"><button type="button" class="menu_button" data-act="resetFloat"><i class="fa-solid fa-location-crosshairs"></i> 找不到悬浮条？重置位置</button></div>
 
@@ -1272,6 +1818,33 @@ function buildSettings(container) {
       <label>模型 <select class="text_pole" data-setting="model">${MODELS.map(([v, n]) => `<option value="${v}">${n}</option>`).join('')}</select></label>
       <input class="text_pole" data-setting="customModel" placeholder="自定义模型 ID，例如 fish-audio/s2.1-pro">
       <label>语速 <span data-ref="speedVal"></span><input type="range" min="0.5" max="2" step="0.05" data-setting="speed"></label>
+
+      <h4>语气标签与 AI</h4>
+      <label class="checkbox_label"><input type="checkbox" data-setting="emoEnabled"> 把 [语气标签] 发给 Fish（关掉后合成前去掉所有方括号标签）</label>
+      <label>朗读前编辑 <select class="text_pole" data-setting="editBeforeRead">
+        <option value="off">不弹编辑器，直接朗读（需要时点消息菜单里的「编辑」按钮）</option>
+        <option value="manual">点 🎧 时先打开编辑器</option>
+        <option value="always">自动朗读的新回复也先打开编辑器</option>
+      </select></label>
+      <label class="checkbox_label"><input type="checkbox" data-setting="rememberEdits"> 编辑器默认勾选「记住这条消息的修改」</label>
+      <label class="checkbox_label"><input type="checkbox" data-setting="aiAuto"> 朗读前自动让 AI 加语气标签（每条消息会多一次 AI 请求）</label>
+      <label>AI 使用的模型 <select class="text_pole" data-setting="aiSource" data-ref="aiSource">${aiSourceOptions(S().aiSource)}</select></label>
+      <label>标签数量 <select class="text_pole" data-setting="aiDensity">
+        <option value="low">少量：只在情绪明显变化处加</option>
+        <option value="normal">适中</option>
+        <option value="high">丰富：语气、笑声、叹气、停顿都可以加</option>
+      </select></label>
+      <label class="checkbox_label"><input type="checkbox" data-setting="aiContext"> 把上一条消息的开头一起发给 AI，帮它判断情绪</label>
+      <label>AI 最多回复 token 数 <input type="number" class="text_pole" min="200" max="8000" data-setting="aiMaxTokens"></label>
+      <label>AI 超时（秒） <input type="number" class="text_pole" min="10" max="300" data-setting="aiTimeout"></label>
+      <label>AI 提示词（系统提示）<textarea class="text_pole fishtts-prompt" rows="6" data-ref="aiPrompt"></textarea></label>
+      <div class="fishtts-row">
+        <button type="button" class="menu_button" data-act="aiPromptReset"><i class="fa-solid fa-rotate-left"></i> 恢复默认提示词</button>
+        <button type="button" class="menu_button" data-act="aiTest"><i class="fa-solid fa-wand-magic-sparkles"></i> <span>用试听句测试 AI 加标签</span></button>
+        <button type="button" class="menu_button" data-act="aiTestPlay" hidden><i class="fa-solid fa-volume-high"></i> 朗读结果</button>
+      </div>
+      <div class="fishtts-aitest" data-ref="aiTestOut" hidden></div>
+      <small class="fishtts-dim">Fish S2 / S2.1 支持在文字里写 [happy]、[whispering]、[laughing]、[break] 这样的方括号标签，也可以写自然语言描述，如 [用颤抖的声音小声说]。标签放在句子开头效果最好。AI 只负责插入标签，改动原文的回复会被丢弃。「酒馆当前连接的模型」会用你当前的预设和 API；角色卡内容太露骨时部分模型可能拒绝，建议在「连接配置」里单独建一个便宜、限制少的配置给它用。</small>
 
       <h4>朗读内容</h4>
       <label>朗读模式 <select class="text_pole" data-setting="readMode">
@@ -1306,9 +1879,64 @@ function buildSettings(container) {
         else if (act === 'testDefault') testVoice(S().defaultVoice);
         else if (act === 'saveKey') await saveKey();
         else if (act === 'resetFloat') resetFloat();
+        else if (act === 'aiPromptReset') {
+            S().aiPrompt = '';
+            save();
+            settingsEl.querySelector('[data-ref="aiPrompt"]').value = DEFAULT_AI_PROMPT;
+            toast('success', '已恢复默认提示词');
+        } else if (act === 'aiTest') await testAi();
+        else if (act === 'aiTestPlay' && aiTestResult) {
+            playNow({ label: 'AI 标签试听', segments: [makeSeg(aiTestResult, S().defaultVoice)], record: null });
+        }
     });
+
+    // AI 提示词：显示内置提示词；和内置的一样时存成空，以后内置提示词升级能自动跟上
+    const promptEl = settingsEl.querySelector('[data-ref="aiPrompt"]');
+    promptEl.value = String(s.aiPrompt || '').trim() || DEFAULT_AI_PROMPT;
+    promptEl.addEventListener('input', () => {
+        const v = promptEl.value.trim();
+        S().aiPrompt = !v || v === DEFAULT_AI_PROMPT.trim() ? '' : promptEl.value;
+        save();
+    });
+
+    // 连接配置可能在别处新建 / 删除，展开下拉框前刷新一次
+    const srcEl = settingsEl.querySelector('[data-ref="aiSource"]');
+    const refreshSources = () => {
+        const cur = S().aiSource;
+        const html = aiSourceOptions(cur);
+        if (srcEl.innerHTML !== html) { srcEl.innerHTML = html; srcEl.value = cur; }
+    };
+    srcEl.addEventListener('focus', refreshSources);
+    srcEl.addEventListener('pointerdown', refreshSources);
+
     refreshSettingsView();
     refreshKeyStatus();
+}
+
+let aiTestResult = '';
+async function testAi() {
+    const btn = settingsEl.querySelector('[data-act="aiTest"]');
+    const out = settingsEl.querySelector('[data-ref="aiTestOut"]');
+    const playBtn = settingsEl.querySelector('[data-act="aiTestPlay"]');
+    if (btn.disabled) return;
+    const text = String(S().testText || DEFAULTS.testText).trim();
+    btn.disabled = true;
+    btn.querySelector('span').textContent = 'AI 处理中…';
+    out.hidden = false;
+    out.textContent = '正在请求 AI…';
+    playBtn.hidden = true;
+    aiTestResult = '';
+    try {
+        const res = await aiTag([text], { speaker: '角色' });
+        aiTestResult = res.texts[0];
+        out.innerHTML = `<b>${res.tagged ? 'AI 返回：' : 'AI 没有加标签：'}</b>${highlightTags(aiTestResult)}`;
+        playBtn.hidden = false;
+    } catch (e) {
+        out.textContent = `失败：${e.message}`;
+    } finally {
+        btn.disabled = false;
+        btn.querySelector('span').textContent = '用试听句测试 AI 加标签';
+    }
 }
 
 function onSettingChange(input) {
@@ -1410,7 +2038,7 @@ async function init() {
     if (prev) {
         try { prev.teardown?.(); } catch { /* 旧实例所在页面已经没了 */ }
     }
-    for (const id of ['fishtts-style', 'fishtts-settings', 'fishtts-panel', 'fishtts-float', 'fishtts-wand']) {
+    for (const id of ['fishtts-style', 'fishtts-settings', 'fishtts-panel', 'fishtts-float', 'fishtts-wand', 'fishtts-editor']) {
         doc.getElementById(id)?.remove();
     }
     HOST.__fishTtsInstance = { owner: window, version: VERSION, ping: () => !!floatEl?.isConnected, teardown };
@@ -1431,6 +2059,7 @@ async function init() {
         else console.warn(TAG, '没找到扩展设置区域，设置抽屉没有显示');
     });
     part('语音面板', buildPanel);
+    part('朗读稿编辑器', buildEditor);
     part('魔杖菜单', addWandEntry);
     cssReady.then(() => updateFloat());
 
@@ -1446,13 +2075,13 @@ async function init() {
     });
 
     onHost(doc, 'click', (e) => {
-        const b = e.target.closest?.('.fishtts-mes-btn');
+        const b = e.target.closest?.('.fishtts-mes-btn, .fishtts-mes-edit');
         if (!b) return;
         e.stopPropagation();
         const mesId = Number(b.closest('.mes')?.getAttribute('mesid'));
         if (!Number.isFinite(mesId)) return;
-        const job = buildMessageJob(mesId, true);
-        if (job) playNow(job);
+        if (b.classList.contains('fishtts-mes-edit')) openEditorForMessage(mesId).catch((err) => toast('error', err.message));
+        else readMessage(mesId);
     });
 
     if (IS_SHELL) window.addEventListener('pagehide', teardown);
