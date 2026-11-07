@@ -6,7 +6,7 @@
 // ============================================================
 import { cleanText, splitText, planSegments, extractVoiceIds, hash53, parseVoiceImport } from './text.js';
 
-const VERSION = '2.0.0';
+const VERSION = '2.0.1';
 const TAG = '[FishTTS]';
 
 // 在酒馆助手脚本（iframe）里运行时，所有界面都画在酒馆主页面上
@@ -669,7 +669,7 @@ let floatEl = null;
 
 function buildFloat() {
     floatEl = mount(el(`
-<div id="fishtts-float" class="fishtts-float">
+<div id="fishtts-float" class="fishtts-float" style="position:fixed;right:16px;bottom:90px;z-index:3000">
   <div class="fishtts-float-handle" title="Fish 语音（点击展开/收起，按住可拖动）"><i class="fa-solid fa-headphones"></i></div>
   <div class="fishtts-float-body">
     <span class="fishtts-float-status">空闲</span>
@@ -718,18 +718,53 @@ function buildFloat() {
         else if (act === 'openPanel') openPanel();
     });
     onHost(HOST, 'resize', () => updateFloat());
+    // 样式表加载完、字体到位、折叠/展开时悬浮条尺寸会变，按新尺寸重新摆一次，避免被挤到屏幕外
+    if (HOST.ResizeObserver) {
+        const ro = new HOST.ResizeObserver(() => { if (!start) updateFloat(); });
+        ro.observe(floatEl);
+        cleanups.push(() => ro.disconnect());
+    }
+    HOST.requestAnimationFrame?.(() => updateFloat());
     updateFloat();
 }
 
+function defaultFloatPosition() {
+    if (!floatEl) return;
+    floatEl.style.left = 'auto';
+    floatEl.style.top = 'auto';
+    floatEl.style.right = '16px';
+    floatEl.style.bottom = '90px';
+}
+
 function placeFloat(x, y) {
-    const w = floatEl.offsetWidth || 48;
-    const h = floatEl.offsetHeight || 48;
-    const cx = Math.min(Math.max(4, x), HOST.innerWidth - w - 4);
-    const cy = Math.min(Math.max(4, y), HOST.innerHeight - h - 4);
-    floatEl.style.left = `${cx}px`;
-    floatEl.style.top = `${cy}px`;
+    if (!floatEl || floatEl.hidden) return;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) { defaultFloatPosition(); return; }
+    const vw = HOST.innerWidth;
+    const vh = HOST.innerHeight;
+    if (!vw || !vh) return;
+    const r = floatEl.getBoundingClientRect();
+    const w = Math.min(r.width || 48, vw - 8);
+    const h = Math.min(r.height || 48, vh - 8);
+    const cx = Math.min(Math.max(4, x), vw - w - 4);
+    const cy = Math.min(Math.max(4, y), vh - h - 4);
+    floatEl.style.left = `${Math.round(cx)}px`;
+    floatEl.style.top = `${Math.round(cy)}px`;
     floatEl.style.right = 'auto';
     floatEl.style.bottom = 'auto';
+}
+
+function resetFloat() {
+    const s = S();
+    s.floatPos = null;
+    s.floatCollapsed = false;
+    s.showFloat = true;
+    save();
+    defaultFloatPosition();
+    const box = settingsEl?.querySelector('[data-setting="showFloat"]');
+    if (box) box.checked = true;
+    updateFloat();
+    if (s.enabled) toast('success', '悬浮条已经回到右下角');
+    else toast('warning', '悬浮条位置已重置。扩展现在是停用状态，勾选「启用」后才会显示');
 }
 
 function updateFloat() {
@@ -743,7 +778,8 @@ function updateFloat() {
     if (icon) icon.className = `fa-solid ${playing ? 'fa-pause' : 'fa-play'}`;
     const q = player.queue.length;
     floatEl.querySelector('.fishtts-float-handle').dataset.count = q ? String(q) : '';
-    if (s.floatPos) placeFloat(s.floatPos.x, s.floatPos.y);
+    if (s.floatPos) placeFloat(Number(s.floatPos.x), Number(s.floatPos.y));
+    else defaultFloatPosition();
 }
 
 // ---------------------------------------------------------------- 语音面板
@@ -1218,6 +1254,7 @@ function buildSettings(container) {
       <label class="checkbox_label"><input type="checkbox" data-setting="readGreeting"> 朗读开场白</label>
       <label class="checkbox_label"><input type="checkbox" data-setting="showMesButton"> 在消息菜单里显示 <i class="fa-solid fa-headphones"></i> 朗读按钮</label>
       <label class="checkbox_label"><input type="checkbox" data-setting="showFloat"> 显示悬浮控制条</label>
+      <div class="fishtts-row"><button type="button" class="menu_button" data-act="resetFloat"><i class="fa-solid fa-location-crosshairs"></i> 找不到悬浮条？重置位置</button></div>
 
       <h4>API Key</h4>
       <select class="text_pole" data-setting="keyMode">
@@ -1268,6 +1305,7 @@ function buildSettings(container) {
         if (act === 'openPanel') openPanel();
         else if (act === 'testDefault') testVoice(S().defaultVoice);
         else if (act === 'saveKey') await saveKey();
+        else if (act === 'resetFloat') resetFloat();
     });
     refreshSettingsView();
     refreshKeyStatus();
@@ -1336,7 +1374,13 @@ function injectCss() {
     link.rel = 'stylesheet';
     link.href = new URL('style.css', MODULE_BASE).href;
     link.id = 'fishtts-style';
+    const ready = new Promise((resolve) => {
+        link.addEventListener('load', () => resolve(true), { once: true });
+        link.addEventListener('error', () => { console.warn(TAG, '样式表加载失败', link.href); resolve(false); }, { once: true });
+        setTimeout(() => resolve(false), 8000);
+    });
     mount(link, doc.head);
+    return ready;
 }
 
 function addWandEntry() {
@@ -1355,23 +1399,40 @@ function teardown() {
 
 async function init() {
     // 扩展和酒馆助手脚本只需要装一个；都装了就只运行先加载的那个
+    // 旧实例的界面还在、所在页面也没关闭，才算还在运行；否则（比如卸载后重装、脚本被删掉）由这次加载接管
     const prev = HOST.__fishTtsInstance;
     let prevAlive = false;
-    try { prevAlive = !!prev && prev.ping() === true; } catch { prevAlive = false; }
+    try { prevAlive = !!prev && !prev.owner?.closed && prev.ping() === true; } catch { prevAlive = false; }
     if (prevAlive) {
         console.warn(TAG, 'Fish 语音已经在运行，跳过重复加载。扩展和酒馆助手脚本只需要装一个。');
         return;
     }
-    HOST.__fishTtsInstance = { owner: window, version: VERSION, ping: () => true };
+    if (prev) {
+        try { prev.teardown?.(); } catch { /* 旧实例所在页面已经没了 */ }
+    }
+    for (const id of ['fishtts-style', 'fishtts-settings', 'fishtts-panel', 'fishtts-float', 'fishtts-wand']) {
+        doc.getElementById(id)?.remove();
+    }
+    HOST.__fishTtsInstance = { owner: window, version: VERSION, ping: () => !!floatEl?.isConnected, teardown };
 
     S();
-    injectCss();
+    const cssReady = injectCss();
 
-    const container = doc.getElementById('extensions_settings2') || doc.getElementById('extensions_settings');
-    if (container) buildSettings(container);
-    buildPanel();
-    buildFloat();
-    addWandEntry();
+    const part = (name, fn) => {
+        try { fn(); } catch (e) {
+            console.error(TAG, `${name}初始化失败`, e);
+            toast('error', `${name}初始化失败：${e?.message || e}`);
+        }
+    };
+    part('悬浮条', buildFloat);
+    part('设置', () => {
+        const container = doc.getElementById('extensions_settings2') || doc.getElementById('extensions_settings');
+        if (container) buildSettings(container);
+        else console.warn(TAG, '没找到扩展设置区域，设置抽屉没有显示');
+    });
+    part('语音面板', buildPanel);
+    part('魔杖菜单', addWandEntry);
+    cssReady.then(() => updateFloat());
 
     const c = ctx();
     const ET = c.eventTypes || c.event_types || {};
