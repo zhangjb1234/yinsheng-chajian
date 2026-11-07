@@ -141,6 +141,13 @@
   background: rgba(127, 127, 127, .1); border: 1px dashed var(--SmartThemeBorderColor, rgba(255, 255, 255, .2));
 }
 .fishtts-aitest[hidden] { display: none; }
+.fishtts-aitest details { margin-top: 6px; }
+.fishtts-aitest summary { cursor: pointer; opacity: .8; }
+.fishtts-airaw { margin-top: 4px; max-height: 240px; overflow: auto; font-size: .85em; opacity: .85; word-break: break-word; }
+/* 自定义 AI 接口 */
+.fishtts-aicustom { margin: 4px 0 8px; }
+.fishtts-aicustom[hidden] { display: none; }
+.fishtts-aicustom small { margin-bottom: 2px; }
 
 /* 朗读稿编辑器（叠在语音面板上面） */
 .fishtts-panel.fishtts-editor { z-index: 10060; }

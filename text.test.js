@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import {
     listEmoTags, stripEmoTags, hasSpeech, speechKey, isS1Model, toSpeechInput, formatTagInsert,
     cleanText, splitText, planSegments, buildTagRequest, parseTagResponse, planKeyOf, DEFAULT_AI_PROMPT,
-    extractVoiceIds, hash53,
+    extractVoiceIds, hash53, normalizeApiBase, readChatCompletion, readModelList,
 } from '../repo/text.js';
 
 describe('语气标签', () => {
@@ -144,11 +144,56 @@ describe('AI 加标签', () => {
         expect(res2.rejected).toBe(1);
     });
 
+    test('parseTagResponse 去掉 AI 在前后多写的整行说明', () => {
+        const res = parseTagResponse('好的，以下是加好标签的文本：\n[gentle] 我有点难过。\n（共加了 1 个标签）', ['我有点难过。']);
+        expect(res).toEqual({ texts: ['[gentle] 我有点难过。'], tagged: 1, rejected: 0 });
+        const res2 = parseTagResponse('###1###\n这是第一段：\n[happy] 你好呀，今天想聊点什么？\n###2###\n[sad] 我有点难过。', originals);
+        expect(res2.texts[0]).toBe('[happy] 你好呀，今天想聊点什么？');
+        expect(res2.rejected).toBe(0);
+        // 只删整行，行内改字仍然拒绝
+        expect(parseTagResponse('好的：[gentle] 我有点难过。', ['我有点难过。']).rejected).toBe(1);
+    });
+
+    test('parseTagResponse 认加粗的分隔行和只剩结尾的 </think>', () => {
+        const out = '一堆思考过程 ###1### 乱写\n</think>\n**###1###**\n[happy] 你好呀，今天想聊点什么？\n> ###2###\n[sad] 我有点难过。';
+        const res = parseTagResponse(out, originals);
+        expect(res.texts).toEqual(['[happy] 你好呀，今天想聊点什么？', '[sad] 我有点难过。']);
+        expect(res.rejected).toBe(0);
+    });
+
     test('planKeyOf 稳定且区分内容', () => {
         const a = planKeyOf([{ text: '一' }, { text: '二' }]);
         expect(planKeyOf([{ text: '一' }, { text: '二' }])).toBe(a);
         expect(planKeyOf([{ text: '一二' }])).not.toBe(a);
         expect(planKeyOf([{ text: '一' }, { text: '三' }])).not.toBe(a);
+    });
+});
+
+describe('自定义 AI 接口工具', () => {
+    test('normalizeApiBase', () => {
+        expect(normalizeApiBase(' https://api.deepseek.com/v1/ ')).toBe('https://api.deepseek.com/v1');
+        expect(normalizeApiBase('https://api.x.ai/v1/chat/completions')).toBe('https://api.x.ai/v1');
+        expect(normalizeApiBase('http://127.0.0.1:5001/v1/models')).toBe('http://127.0.0.1:5001/v1');
+        expect(normalizeApiBase('api.deepseek.com/v1')).toBe('');
+        expect(normalizeApiBase('javascript:alert(1)')).toBe('');
+    });
+
+    test('readChatCompletion', () => {
+        expect(readChatCompletion({ choices: [{ message: { content: '[happy] 你好' }, finish_reason: 'stop' }] })).toEqual({ text: '[happy] 你好', reasoning: '', finish: 'stop' });
+        expect(readChatCompletion({ choices: [{ message: { content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] } }] }).text).toBe('ab');
+        const r = readChatCompletion({ choices: [{ message: { content: null, reasoning_content: '想…' }, finish_reason: 'length' }] });
+        expect(r.text).toBe('');
+        expect(r.reasoning).toBe('想…');
+        expect(r.finish).toBe('length');
+        expect(readChatCompletion({ choices: [{ text: '旧接口' }] }).text).toBe('旧接口');
+        expect(readChatCompletion(null).text).toBe('');
+    });
+
+    test('readModelList', () => {
+        expect(readModelList({ data: [{ id: 'b' }, { id: 'a' }, { id: 'a' }] })).toEqual(['a', 'b']);
+        expect(readModelList({ models: [{ name: 'gemma' }] })).toEqual(['gemma']);
+        expect(readModelList(['x', ''])).toEqual(['x']);
+        expect(readModelList({ error: true })).toEqual([]);
     });
 });
 

@@ -46,14 +46,37 @@ if (!URL.createObjectURL) URL.createObjectURL = () => 'blob:fake';
 if (!URL.revokeObjectURL) URL.revokeObjectURL = () => {};
 
 const ttsCalls = [];
+// 自定义 AI 接口：mode = good（前面多一行客套话）/ unauthorized（酒馆转发时上游 401）/ refuse（拒绝）
+const custom = { mode: 'good', calls: [] };
+function customReply(body) {
+    if (custom.mode === 'refuse') return { choices: [{ message: { content: '抱歉，我不能帮你处理这段内容。' }, finish_reason: 'stop' }] };
+    return { choices: [{ message: { content: `好的，以下是加好标签的文本：\n${fakeTag(body.messages[1].content)}` }, finish_reason: 'stop' }] };
+}
 W.fetch = globalThis.fetch = async (url, init = {}) => {
     const u = String(url);
-    const ok = (body, type = 'application/json') => ({ ok: true, status: 200, json: async () => JSON.parse(body), text: async () => body, blob: async () => new Blob([body], { type }) });
+    const ok = (body, type = 'application/json', status = 200) => ({ ok: status < 400, status, json: async () => JSON.parse(body), text: async () => body, blob: async () => new Blob([body], { type }) });
     if (u.endsWith('/api/secrets/read')) return ok('{}');
     if (u.endsWith('/api/openai/custom/generate-voice')) {
         ttsCalls.push(JSON.parse(init.body));
         return ok(`mp3-${ttsCalls.length}`, 'audio/mpeg');
     }
+    if (u.endsWith('/api/backends/chat-completions/generate')) {
+        const body = JSON.parse(init.body);
+        custom.calls.push({ url: u, headers: init.headers, body });
+        // 和真实酒馆一样：上游出错时也是 200 + {error: {message: statusText}}
+        if (custom.mode === 'unauthorized') return ok(JSON.stringify({ error: { message: 'Unauthorized' }, quota_error: false }));
+        return ok(JSON.stringify(customReply(body)));
+    }
+    if (u.endsWith('/api/backends/chat-completions/status')) {
+        custom.calls.push({ url: u, headers: init.headers, body: JSON.parse(init.body) });
+        return ok(JSON.stringify({ object: 'list', data: [{ id: 'm-b' }, { id: 'm-a' }] }));
+    }
+    if (u === 'https://ai.example.com/v1/chat/completions') {
+        const body = JSON.parse(init.body);
+        custom.calls.push({ url: u, headers: init.headers, body });
+        return ok(JSON.stringify(customReply(body)));
+    }
+    if (u.startsWith('https://nocors.example.com/')) throw new TypeError('Failed to fetch');
     throw new Error(`测试里没有模拟这个请求：${u}`);
 };
 
@@ -131,7 +154,7 @@ afterAll(async () => { await GlobalRegistrator.unregister(); });
 
 // ---------------------------------------------------------------- 用例
 
-describe('v2.1.0 冒烟测试', () => {
+describe('v2.2.0 冒烟测试', () => {
     test('初始化：编辑器、消息按钮、设置项都在', () => {
         expect($('#fishtts-editor')).toBeTruthy();
         expect($('.fishtts-mes-btn')).toBeTruthy();
@@ -139,7 +162,8 @@ describe('v2.1.0 冒烟测试', () => {
         expect(S().emoEnabled).toBe(true);
         expect(S().editBeforeRead).toBe('off');
         const src = $('#fishtts-settings [data-setting="aiSource"]');
-        expect([...src.options].map((o) => o.value)).toEqual(['main', 'p1']);
+        expect([...src.options].map((o) => o.value)).toEqual(['main', 'custom', 'p1']);
+        expect($('#fishtts-settings [data-ref="aiCustomBox"]').hidden).toBe(true);
         expect($('#fishtts-settings [data-ref="aiPrompt"]').value).toContain('配音导演');
         expect($$('#fishtts-editor [data-act="edTag"]').length).toBeGreaterThan(40);
     });
@@ -292,5 +316,120 @@ describe('v2.1.0 冒烟测试', () => {
         click($('#fishtts-settings [data-act="aiPromptReset"]'));
         expect(S().aiPrompt).toBe('');
         expect(p.value).toContain('配音导演');
+    });
+
+    const setting = (k) => $(`#fishtts-settings [data-setting="${k}"]`);
+    const setValue = (k, v, type = 'change') => {
+        const node = setting(k);
+        node.value = v;
+        node.dispatchEvent(new W.Event(type, { bubbles: true }));
+    };
+    const aiOut = () => $('#fishtts-settings [data-ref="aiTestOut"]');
+    async function runAiTest(what) {
+        click($('#fishtts-settings [data-act="aiTest"]'));
+        expect(aiOut().textContent).toBe('正在请求 AI…');
+        await until(() => !$('#fishtts-settings [data-act="aiTest"]').disabled, 3000, what);
+        return aiOut();
+    }
+
+    test('自定义接口（经酒馆转发）：保存 Key、获取模型列表、测试加标签', async () => {
+        setValue('aiSource', 'custom');
+        expect(S().aiSource).toBe('custom');
+        expect($('#fishtts-settings [data-ref="aiCustomBox"]').hidden).toBe(false);
+        expect(S().aiVia).toBe('st');
+
+        setValue('aiUrl', 'https://ai.example.com/v1/chat/completions', 'input');
+        expect(S().aiUrl).toBe('https://ai.example.com/v1/chat/completions');
+
+        const keyInput = $('#fishtts-settings [data-ref="aiKeyInput"]');
+        keyInput.value = 'sk-test-123456';
+        click($('#fishtts-settings [data-act="aiSaveKey"]'));
+        expect(S().aiKey).toBe('sk-test-123456');
+        expect(keyInput.value).toBe('');
+        const status = $('#fishtts-settings [data-ref="aiKeyStatus"]').textContent;
+        expect(status).toContain('sk-…3456');
+        expect(status).not.toContain('sk-test-123456');
+
+        custom.calls.length = 0;
+        click($('#fishtts-settings [data-act="aiModels"]'));
+        await until(() => S().aiModel === 'm-a', 3000, '模型列表');
+        expect(setting('aiModel').value).toBe('m-a');
+        expect($$('#fishtts-aimodels option').map((o) => o.value)).toEqual(['m-a', 'm-b']);
+        expect(custom.calls[0].url).toBe('http://127.0.0.1:8000/api/backends/chat-completions/status');
+        expect(custom.calls[0].body).toMatchObject({ chat_completion_source: 'custom', custom_url: 'https://ai.example.com/v1' });
+
+        custom.calls.length = 0;
+        const out = await runAiTest('自定义接口测试');
+        expect(out.querySelector('.fishtts-tagchip')?.textContent).toBe('[happy]');
+        expect(out.textContent).toContain('你好呀，这是 Fish Audio 语音试听。');
+        expect(custom.calls).toHaveLength(1);
+        const call = custom.calls[0];
+        expect(call.url).toBe('http://127.0.0.1:8000/api/backends/chat-completions/generate');
+        expect(call.headers['X-CSRF-Token']).toBe('t');
+        expect(call.body).toMatchObject({
+            chat_completion_source: 'custom',
+            custom_url: 'https://ai.example.com/v1',
+            model: 'm-a',
+            max_tokens: 1500,
+            stream: false,
+        });
+        expect(JSON.parse(call.body.custom_include_headers)).toEqual({ Authorization: 'Bearer sk-test-123456' });
+        expect(call.body.messages[0]).toMatchObject({ role: 'system' });
+        expect(call.body.messages[0].content).toContain('配音导演');
+        expect(call.body.messages[1].role).toBe('user');
+    });
+
+    test('自定义接口：上游拒绝 Key 时给出可读的错误', async () => {
+        custom.mode = 'unauthorized';
+        try {
+            const out = await runAiTest('Key 被拒绝');
+            expect(out.textContent).toStartWith('失败：');
+            expect(out.textContent).toContain('接口拒绝了 Key');
+            expect(out.querySelector('details')).toBeNull();
+        } finally {
+            custom.mode = 'good';
+        }
+    });
+
+    test('自定义接口：AI 拒绝时显示 AI 的原始回复', async () => {
+        custom.mode = 'refuse';
+        try {
+            const out = await runAiTest('AI 拒绝');
+            expect(out.textContent).toContain('改动了原文或格式不对');
+            const raw = out.querySelector('details .fishtts-airaw');
+            expect(out.querySelector('details summary').textContent).toBe('AI 的原始回复');
+            expect(raw.textContent).toBe('抱歉，我不能帮你处理这段内容。');
+        } finally {
+            custom.mode = 'good';
+        }
+    });
+
+    test('自定义接口（浏览器直连）：带 Authorization；不允许跨域时提示改用转发', async () => {
+        setValue('aiVia', 'direct');
+        expect(S().aiVia).toBe('direct');
+        custom.calls.length = 0;
+        let out = await runAiTest('直连测试');
+        expect(out.querySelector('.fishtts-tagchip')?.textContent).toBe('[happy]');
+        expect(custom.calls).toHaveLength(1);
+        expect(custom.calls[0].url).toBe('https://ai.example.com/v1/chat/completions');
+        expect(custom.calls[0].headers.Authorization).toBe('Bearer sk-test-123456');
+        expect(custom.calls[0].body).toMatchObject({ model: 'm-a', stream: false });
+        expect(custom.calls[0].body.chat_completion_source).toBeUndefined();
+
+        setValue('aiUrl', 'https://nocors.example.com/v1', 'input');
+        out = await runAiTest('直连跨域失败');
+        expect(out.textContent).toContain('跨域');
+        expect(out.textContent).toContain('经酒馆后端转发');
+    });
+
+    test('加标签从来不改聊天正文', () => {
+        expect(chat[0].mes).toBe('你好呀！*挥手* 今天天气真好。');
+        expect(chat[1].mes).toBe('我有点难过。');
+        expect(chat[2].mes).toBe('晚安。');
+        // 收尾：恢复默认 AI 来源
+        setValue('aiVia', 'st');
+        setValue('aiSource', 'main');
+        expect($('#fishtts-settings [data-ref="aiCustomBox"]').hidden).toBe(true);
+        custom.mode = 'good';
     });
 });

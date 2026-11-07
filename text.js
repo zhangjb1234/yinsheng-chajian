@@ -226,9 +226,13 @@ export function buildTagRequest(texts, { speaker = '', density = 'normal', conte
 export function parseTagResponse(output, originals) {
     let out = String(output ?? '');
     out = out.replace(/<(think|thinking|reasoning)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '');
+    // 有的接口只留下结尾的 </think>：去掉它之前的思考过程
+    const closeAt = out.search(/<\/(think|thinking|reasoning)\s*>(?![\s\S]*<\/(think|thinking|reasoning)\s*>)/i);
+    if (closeAt >= 0) out = out.slice(closeAt).replace(/^<\/[a-z]+\s*>/i, '');
     out = out.replace(/^\s*```[a-z]*\s*$/gim, '');
     const map = new Map();
-    const re = /^[ \t]*#{3}[ \t]*(\d+)[ \t]*#{3}[ \t]*$/gm;
+    // 允许 AI 给分隔行加粗或引用：**###1###**、> ###1###
+    const re = /^[ \t>*_]*#{3}[ \t]*(\d+)[ \t]*#{3}[ \t*_]*$/gm;
     const marks = [...out.matchAll(re)];
     marks.forEach((m, i) => {
         const start = m.index + m[0].length;
@@ -243,14 +247,67 @@ export function parseTagResponse(output, originals) {
     let rejected = 0;
     const texts = originals.map((orig, i) => {
         const cand = map.get(i + 1);
-        if (!cand) { rejected++; return orig; }
-        const fixed = cand.replace(/[ \t]+\n/g, '\n').trim();
-        if (speechKey(fixed) !== speechKey(orig)) { rejected++; return orig; }
+        const fixed = cand ? matchOriginal(cand, orig) : null;
+        if (fixed === null) { rejected++; return orig; }
         if (listEmoTags(fixed).some((t) => t.length > 40)) { rejected++; return orig; }
         if (listEmoTags(fixed).length > listEmoTags(orig).length) tagged++;
         return fixed;
     });
     return { texts, tagged, rejected };
+}
+
+/**
+ * 校验一段 AI 回复：去掉标签后必须和原文一致。
+ * AI 常在前后多写一行「好的，以下是加好标签的文本：」之类的话，所以也试着去掉开头 / 结尾的整行再比。
+ * 只删整行、不改行内文字，校验没有放宽。
+ * @returns {string|null} 通过校验的文字；对不上时为 null
+ */
+function matchOriginal(cand, orig) {
+    const key = speechKey(orig);
+    const fixed = cand.replace(/[ \t]+\n/g, '\n').trim();
+    if (speechKey(fixed) === key) return fixed;
+    const lines = fixed.split('\n');
+    if (lines.length < 2 || lines.length > 60) return null;
+    for (let a = 0; a < lines.length; a++) {
+        for (let b = lines.length; b > a; b--) {
+            if (a === 0 && b === lines.length) continue;
+            const t = lines.slice(a, b).join('\n').trim();
+            if (t && speechKey(t) === key) return t;
+        }
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------- 自定义 AI 接口（OpenAI 兼容）
+
+/**
+ * 整理用户填的接口地址：去掉结尾的 / 和 /chat/completions、/models。
+ * 只接受 http(s)，否则返回 ''。
+ */
+export function normalizeApiBase(url) {
+    let v = String(url ?? '').trim().replace(/\/+$/, '');
+    v = v.replace(/\/(chat\/completions|completions|models)$/i, '').replace(/\/+$/, '');
+    return /^https?:\/\/[^\s/]+/i.test(v) ? v : '';
+}
+
+/**
+ * 从 OpenAI 兼容的 /chat/completions 回复里取出正文。
+ * @returns {{text: string, reasoning: string, finish: string}}
+ */
+export function readChatCompletion(data) {
+    const choice = data?.choices?.[0] ?? {};
+    const msg = choice.message ?? {};
+    let text = msg.content ?? choice.text ?? data?.content ?? '';
+    if (Array.isArray(text)) text = text.map((p) => (typeof p === 'string' ? p : p?.text ?? '')).join('');
+    const reasoning = String(msg.reasoning_content ?? msg.reasoning ?? '');
+    return { text: String(text ?? ''), reasoning, finish: String(choice.finish_reason ?? '') };
+}
+
+/** 从 /models 回复里取模型 ID 列表（兼容 {data:[{id}]}、{models:[{name}]}、字符串数组）。 */
+export function readModelList(data) {
+    const list = Array.isArray(data) ? data : Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : [];
+    const ids = list.map((m) => (typeof m === 'string' ? m : m?.id ?? m?.name ?? '')).map((s) => String(s).trim()).filter(Boolean);
+    return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
 }
 
 // ---------------------------------------------------------------- 其它

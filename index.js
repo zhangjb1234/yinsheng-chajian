@@ -4,15 +4,18 @@
 // • 合成：Fish Audio OpenAI 兼容接口（/compat/v1/audio/speech），不需要服务端插件。
 // • Key：默认存在酒馆密钥库，由酒馆后端转发；也可选浏览器直连。
 // • 语气：朗读稿里写 [happy] [whispering] 这样的 Fish S2 语气标签；可以让 AI 自动加，
-//   也可以在「朗读稿编辑器」里朗读前 / 从朗读历史里手动改。
+//   也可以在「朗读稿编辑器」里朗读前 / 从朗读历史里手动改。加标签的 AI 可以是酒馆当前的模型、
+//   某个连接配置，或单独填写的 OpenAI 兼容接口（地址 + Key + 模型）。
+//   标签只存在本扩展的朗读稿里，不会写回聊天正文。
 // ============================================================
 import {
     cleanText, splitText, planSegments, extractVoiceIds, hash53, parseVoiceImport,
     stripEmoTags, hasSpeech, listEmoTags, toSpeechInput, isS1Model, formatTagInsert,
     DEFAULT_AI_PROMPT, buildTagRequest, parseTagResponse, planKeyOf,
+    normalizeApiBase, readChatCompletion, readModelList,
 } from './text.js';
 
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 const TAG = '[FishTTS]';
 
 // 在酒馆助手脚本（iframe）里运行时，所有界面都画在酒馆主页面上
@@ -70,7 +73,11 @@ const DEFAULTS = {
     editBeforeRead: 'off',     // off：直接读；manual：点 🎧 时先打开编辑器；always：自动朗读也先打开编辑器
     rememberEdits: true,       // 编辑器里「记住这条消息的修改」的默认值
     aiAuto: false,             // 朗读前自动让 AI 加语气标签
-    aiSource: 'main',          // main = 酒馆当前连接的模型；其它值 = 连接配置（Connection Profile）ID
+    aiSource: 'main',          // main = 酒馆当前连接的模型；custom = 下面的自定义接口；其它值 = 连接配置（Connection Profile）ID
+    aiUrl: '',                 // 自定义接口地址（OpenAI 兼容），例如 https://api.deepseek.com/v1
+    aiKey: '',                 // 自定义接口的 Key（存在扩展设置里）
+    aiModel: '',               // 自定义接口的模型名
+    aiVia: 'st',               // st = 经酒馆后端转发（没有跨域问题）；direct = 浏览器直连
     aiDensity: 'normal',
     aiContext: true,           // 把上一条消息的开头发给 AI 帮助判断情绪
     aiPrompt: '',              // 空 = 用内置提示词
@@ -586,25 +593,26 @@ function connectionProfiles() {
 }
 
 function aiSourceOptions(selected) {
-    const opts = [['main', '酒馆当前连接的模型']];
+    const opts = [['main', '酒馆当前连接的模型'], ['custom', '自定义接口（单独填地址、Key、模型）']];
     for (const p of connectionProfiles()) opts.push([p.id, `连接配置：${p.name || p.id}`]);
     if (selected && !opts.some(([id]) => id === selected)) opts.push([selected, '（已删除的连接配置）']);
     return opts.map(([id, name]) => `<option value="${esc(id)}"${id === selected ? ' selected' : ''}>${esc(name)}</option>`).join('');
 }
 
-async function aiGenerate(system, user) {
+async function aiGenerate(system, user, signal) {
     const s = S();
     const c = ctx();
     const maxTokens = Math.max(200, Number(s.aiMaxTokens) || DEFAULTS.aiMaxTokens);
+    if (s.aiSource === 'custom') return customGenerate(system, user, maxTokens, signal);
     if (s.aiSource && s.aiSource !== 'main') {
         const svc = c.ConnectionManagerRequestService;
-        if (!svc?.sendRequest) throw new Error('当前酒馆版本不支持按连接配置调用，请把「AI 使用的模型」改成「酒馆当前连接的模型」');
+        if (!svc?.sendRequest) throw new Error('当前酒馆版本不支持按连接配置调用，请把「AI 使用的模型」改成「酒馆当前连接的模型」或「自定义接口」');
         if (!connectionProfiles().some((p) => p.id === s.aiSource)) throw new Error('选择的连接配置已经不存在，请在扩展设置里重新选择');
         const messages = [{ role: 'system', content: system }, { role: 'user', content: user }];
         const r = await svc.sendRequest(s.aiSource, messages, maxTokens, { stream: false, extractData: true, includePreset: true, includeInstruct: true });
         return typeof r === 'string' ? r : String(r?.content ?? r?.text ?? '');
     }
-    if (typeof c.generateRaw !== 'function') throw new Error('当前酒馆版本没有 generateRaw，无法调用 AI');
+    if (typeof c.generateRaw !== 'function') throw new Error('当前酒馆版本没有 generateRaw，请在「AI 使用的模型」里改用「自定义接口」');
     // 新版酒馆的 generateRaw 收一个对象参数（函数 length 为 0）；旧版收位置参数
     const out = c.generateRaw.length === 0
         ? await c.generateRaw({ prompt: user, systemPrompt: system, responseLength: maxTokens, trimNames: false })
@@ -620,8 +628,97 @@ function withTimeout(promise, ms, message) {
     ]);
 }
 
+// ---- 自定义接口（OpenAI 兼容 /chat/completions）
+// st：经酒馆后端 /api/backends/chat-completions/generate 转发（chat_completion_source = custom），没有跨域问题；
+//     Key 放在 custom_include_headers 里，会覆盖酒馆默认加的 Authorization。Key 留空时酒馆用它自己保存的「自定义」Key。
+// direct：浏览器直接请求 <地址>/chat/completions，接口必须允许跨域。
+
+function customConfig() {
+    const s = S();
+    const base = normalizeApiBase(s.aiUrl);
+    if (!base) throw new Error('请先在设置里填写自定义接口地址，例如 https://api.deepseek.com/v1');
+    const key = String(s.aiKey || '').trim();
+    return { base, key, model: String(s.aiModel || '').trim(), via: s.aiVia === 'direct' ? 'direct' : 'st' };
+}
+const authHeaderYaml = (key) => (key ? JSON.stringify({ Authorization: `Bearer ${key}` }) : '');
+
+function explainAiError(status, data, text) {
+    const e = data?.error;
+    const msg = String((typeof e === 'string' ? e : e?.message) ?? data?.message ?? '').trim() || String(text || '').trim().slice(0, 200);
+    if (status === 401 || status === 403 || /unauthori|forbidden|invalid.{0,20}key|incorrect api key|authenticat/i.test(msg)) return `接口拒绝了 Key（${msg || `HTTP ${status}`}），请检查 Key`;
+    if (status === 402 || /payment|balance|insufficient|quota|credit|余额/i.test(msg)) return `余额或额度不足：${msg}`;
+    if (status === 429 || /rate.?limit|too many/i.test(msg)) return '请求太频繁，稍等一下再试';
+    if (status === 404 || /not.?found|does not exist|no such model|model_not_found/i.test(msg)) return `接口地址或模型名不对（${msg || 'HTTP 404'}）。地址一般以 /v1 结尾，模型名可以点「获取模型列表」选择`;
+    if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|fetch failed|getaddrinfo|socket hang up|certificate/i.test(msg)) return `酒馆连不上这个地址：${msg}`;
+    return `AI 接口出错${status ? `（HTTP ${status}）` : ''}${msg ? `：${msg.slice(0, 200)}` : ''}`;
+}
+
+async function customFetch(path, init, cfg) {
+    try {
+        return await fetch(path, init);
+    } catch (e) {
+        if (e?.name === 'AbortError') throw e;
+        if (cfg.via === 'direct') throw new Error(`浏览器直连 ${cfg.base} 失败（多半是这个接口不允许跨域）：请把「请求方式」改成「经酒馆后端转发」`);
+        throw new Error(`请求酒馆后端失败：${e.message}`);
+    }
+}
+
+async function readJson(r) {
+    const text = await r.text().catch(() => '');
+    let data = null;
+    try { data = JSON.parse(text); } catch { /* 不是 JSON */ }
+    return { text, data };
+}
+
+async function customGenerate(system, user, maxTokens, signal) {
+    const cfg = customConfig();
+    if (!cfg.model) throw new Error('请先填写自定义接口的模型名（可以点「获取模型列表」选择）');
+    const messages = [{ role: 'system', content: system }, { role: 'user', content: user }];
+    const body = { model: cfg.model, messages, max_tokens: maxTokens, temperature: 0.4, stream: false };
+    const r = cfg.via === 'direct'
+        ? await customFetch(`${cfg.base}/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...(cfg.key ? { Authorization: `Bearer ${cfg.key}` } : {}) },
+            body: JSON.stringify(body),
+            signal,
+        }, cfg)
+        : await customFetch(`${HOST.location.origin}/api/backends/chat-completions/generate`, {
+            method: 'POST',
+            headers: ctx().getRequestHeaders(),
+            body: JSON.stringify({ ...body, chat_completion_source: 'custom', custom_url: cfg.base, custom_include_headers: authHeaderYaml(cfg.key) }),
+            signal,
+        }, cfg);
+    const { text, data } = await readJson(r);
+    // 酒馆转发时上游出错也会返回 200 + {error: {message}}
+    if (!r.ok || !data || data.error) throw new Error(explainAiError(r.status === 200 ? 0 : r.status, data, data ? '' : text));
+    const out = readChatCompletion(data);
+    if (!out.text.trim()) {
+        if (out.reasoning || out.finish === 'length') throw new Error('AI 只输出了思考过程、没有正文：把「AI 最多回复 token 数」调大，或换一个非推理模型');
+        throw new Error('AI 返回了空内容（可能被模型的内容审核拦下了）');
+    }
+    return out.text;
+}
+
+/** 「获取模型列表」：返回模型 ID 数组 */
+async function fetchCustomModels() {
+    const cfg = customConfig();
+    const r = cfg.via === 'direct'
+        ? await customFetch(`${cfg.base}/models`, { headers: cfg.key ? { Authorization: `Bearer ${cfg.key}` } : {} }, cfg)
+        : await customFetch(`${HOST.location.origin}/api/backends/chat-completions/status`, {
+            method: 'POST',
+            headers: ctx().getRequestHeaders(),
+            body: JSON.stringify({ chat_completion_source: 'custom', custom_url: cfg.base, custom_include_headers: authHeaderYaml(cfg.key) }),
+        }, cfg);
+    const { text, data } = await readJson(r);
+    if (!r.ok || !data || (data.error && !Array.isArray(data.data))) {
+        throw new Error(data?.error === true ? '接口没有返回模型列表（地址或 Key 不对，或这个接口不支持 /models）；可以直接手动填写模型名' : explainAiError(r.status, data, text));
+    }
+    return readModelList(data);
+}
+
 /**
  * 让 AI 给每段朗读稿加语气标签。AI 改动了原文的段落保持原样。
+ * 结果只用于朗读（存在本扩展的朗读稿库里），不会改聊天正文。
  * @returns {Promise<{texts: string[], tagged: number, rejected: number}>}
  */
 async function aiTag(texts, { speaker = '', context = '' } = {}) {
@@ -629,11 +726,21 @@ async function aiTag(texts, { speaker = '', context = '' } = {}) {
     const system = String(s.aiPrompt || '').trim() || DEFAULT_AI_PROMPT;
     const user = buildTagRequest(texts, { speaker, density: s.aiDensity, context });
     const sec = Math.min(300, Math.max(10, Number(s.aiTimeout) || DEFAULTS.aiTimeout));
-    const out = await withTimeout(aiGenerate(system, user), sec * 1000, `AI 超过 ${sec} 秒没有回复`);
+    const ctrl = new AbortController();
+    let out;
+    try {
+        out = await withTimeout(aiGenerate(system, user, ctrl.signal), sec * 1000, `AI 超过 ${sec} 秒没有回复（可以在设置里调大超时）`);
+    } catch (e) {
+        ctrl.abort();
+        throw e;
+    }
+    if (!String(out ?? '').trim()) throw new Error('AI 返回了空内容（可能被拒绝，或推理模型的 token 不够用）');
     const res = parseTagResponse(out, texts);
     if (res.rejected === texts.length) {
         console.warn(TAG, 'AI 回复无法使用：', out);
-        throw new Error('AI 的回复改动了原文或格式不对，已忽略（可以换个模型，或在设置里调整提示词）');
+        const err = new Error('AI 的回复改动了原文或格式不对，已忽略（可以换个模型，或在设置里调整提示词）');
+        err.aiOutput = String(out);
+        throw err;
     }
     return res;
 }
@@ -1829,6 +1936,25 @@ function buildSettings(container) {
       <label class="checkbox_label"><input type="checkbox" data-setting="rememberEdits"> 编辑器默认勾选「记住这条消息的修改」</label>
       <label class="checkbox_label"><input type="checkbox" data-setting="aiAuto"> 朗读前自动让 AI 加语气标签（每条消息会多一次 AI 请求）</label>
       <label>AI 使用的模型 <select class="text_pole" data-setting="aiSource" data-ref="aiSource">${aiSourceOptions(S().aiSource)}</select></label>
+      <div class="fishtts-box fishtts-aicustom" data-ref="aiCustomBox">
+        <label>接口地址（OpenAI 兼容）<input class="text_pole" data-setting="aiUrl" placeholder="例如 https://api.deepseek.com/v1" autocomplete="off" spellcheck="false"></label>
+        <div class="fishtts-row">
+          <input type="password" class="text_pole fishtts-grow" data-ref="aiKeyInput" placeholder="这个接口的 API Key" autocomplete="off">
+          <button type="button" class="menu_button" data-act="aiSaveKey">保存 Key</button>
+          <button type="button" class="menu_button" data-act="aiClearKey" title="清除保存的 Key">清除</button>
+        </div>
+        <small class="fishtts-dim" data-ref="aiKeyStatus"></small>
+        <div class="fishtts-row">
+          <input class="text_pole fishtts-grow" data-setting="aiModel" list="fishtts-aimodels" placeholder="模型名，例如 deepseek-chat" autocomplete="off" spellcheck="false">
+          <datalist id="fishtts-aimodels"></datalist>
+          <button type="button" class="menu_button" data-act="aiModels"><i class="fa-solid fa-list"></i> <span>获取模型列表</span></button>
+        </div>
+        <label>请求方式 <select class="text_pole" data-setting="aiVia">
+          <option value="st">经酒馆后端转发（推荐，没有跨域问题）</option>
+          <option value="direct">浏览器直连（接口必须允许跨域）</option>
+        </select></label>
+        <small class="fishtts-dim">只用来加语气标签，和聊天用的模型互不影响，可以填一个便宜、限制少的模型。Key 存在本扩展的设置里（酒馆的 settings.json），导出音色配置时不会带出去。</small>
+      </div>
       <label>标签数量 <select class="text_pole" data-setting="aiDensity">
         <option value="low">少量：只在情绪明显变化处加</option>
         <option value="normal">适中</option>
@@ -1844,7 +1970,7 @@ function buildSettings(container) {
         <button type="button" class="menu_button" data-act="aiTestPlay" hidden><i class="fa-solid fa-volume-high"></i> 朗读结果</button>
       </div>
       <div class="fishtts-aitest" data-ref="aiTestOut" hidden></div>
-      <small class="fishtts-dim">Fish S2 / S2.1 支持在文字里写 [happy]、[whispering]、[laughing]、[break] 这样的方括号标签，也可以写自然语言描述，如 [用颤抖的声音小声说]。标签放在句子开头效果最好。AI 只负责插入标签，改动原文的回复会被丢弃。「酒馆当前连接的模型」会用你当前的预设和 API；角色卡内容太露骨时部分模型可能拒绝，建议在「连接配置」里单独建一个便宜、限制少的配置给它用。</small>
+      <small class="fishtts-dim">Fish S2 / S2.1 支持在文字里写 [happy]、[whispering]、[laughing]、[break] 这样的方括号标签，也可以写自然语言描述，如 [用颤抖的声音小声说]。标签放在句子开头效果最好。AI 只负责插入标签，改动原文的回复会被丢弃；加好的标签只存在本扩展的朗读稿里，<b>不会改聊天正文</b>，也不会进入角色的上下文。「酒馆当前连接的模型」会用你当前的预设和 API；角色卡内容太露骨时部分模型可能拒绝，建议选「自定义接口」或在「连接配置」里单独建一个便宜、限制少的配置给它用。</small>
 
       <h4>朗读内容</h4>
       <label>朗读模式 <select class="text_pole" data-setting="readMode">
@@ -1885,6 +2011,21 @@ function buildSettings(container) {
             settingsEl.querySelector('[data-ref="aiPrompt"]').value = DEFAULT_AI_PROMPT;
             toast('success', '已恢复默认提示词');
         } else if (act === 'aiTest') await testAi();
+        else if (act === 'aiSaveKey') {
+            const input = settingsEl.querySelector('[data-ref="aiKeyInput"]');
+            const key = input.value.trim();
+            if (!key) { toast('warning', '请先粘贴这个接口的 API Key'); return; }
+            S().aiKey = key;
+            save();
+            input.value = '';
+            refreshSettingsView();
+            toast('success', 'Key 已保存，可以点「获取模型列表」或「用试听句测试 AI 加标签」试一下');
+        } else if (act === 'aiClearKey') {
+            S().aiKey = '';
+            save();
+            refreshSettingsView();
+            toast('info', '已清除自定义接口的 Key');
+        } else if (act === 'aiModels') await loadAiModels();
         else if (act === 'aiTestPlay' && aiTestResult) {
             playNow({ label: 'AI 标签试听', segments: [makeSeg(aiTestResult, S().defaultVoice)], record: null });
         }
@@ -1933,9 +2074,43 @@ async function testAi() {
         playBtn.hidden = false;
     } catch (e) {
         out.textContent = `失败：${e.message}`;
+        if (e.aiOutput) {
+            // 把 AI 的原始回复给用户看，方便判断是模型拒绝了、改了字，还是格式不对
+            const d = doc.createElement('details');
+            const sum = doc.createElement('summary');
+            sum.textContent = 'AI 的原始回复';
+            const pre = doc.createElement('div');
+            pre.className = 'fishtts-airaw';
+            pre.textContent = e.aiOutput.slice(0, 2000);
+            d.append(sum, pre);
+            out.append(d);
+        }
     } finally {
         btn.disabled = false;
         btn.querySelector('span').textContent = '用试听句测试 AI 加标签';
+    }
+}
+
+async function loadAiModels() {
+    const btn = settingsEl.querySelector('[data-act="aiModels"]');
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.querySelector('span').textContent = '读取中…';
+    try {
+        const ids = await fetchCustomModels();
+        settingsEl.querySelector('#fishtts-aimodels').innerHTML = ids.map((id) => `<option value="${esc(id)}"></option>`).join('');
+        const input = settingsEl.querySelector('[data-setting="aiModel"]');
+        if (!ids.length) toast('warning', '接口返回的模型列表是空的，请手动填写模型名');
+        else {
+            if (!String(S().aiModel || '').trim()) { input.value = ids[0]; onSettingChange(input); }
+            toast('success', `读到 ${ids.length} 个模型，点模型名输入框可以选择`);
+            input.focus();
+        }
+    } catch (e) {
+        toast('error', e.message);
+    } finally {
+        btn.disabled = false;
+        btn.querySelector('span').textContent = '获取模型列表';
     }
 }
 
@@ -1964,6 +2139,11 @@ function refreshSettingsView() {
     const s = S();
     settingsEl.querySelector('[data-setting="customModel"]').hidden = s.model !== 'custom';
     settingsEl.querySelector('[data-ref="speedVal"]').textContent = `${Number(s.speed).toFixed(2)}x`;
+    settingsEl.querySelector('[data-ref="aiCustomBox"]').hidden = s.aiSource !== 'custom';
+    const key = String(s.aiKey || '');
+    settingsEl.querySelector('[data-ref="aiKeyStatus"]').textContent = key
+        ? `已保存（${maskKey(key)}）。`
+        : (s.aiVia === 'direct' ? '尚未填写 Key（接口不需要 Key 时可以留空）。' : '尚未填写 Key：经酒馆转发时会用酒馆 API 设置里「自定义（OpenAI 兼容）」保存的 Key；接口不需要 Key 时也可以留空。');
 }
 
 async function refreshKeyStatus() {
