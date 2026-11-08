@@ -15,7 +15,7 @@ import {
     normalizeApiBase, readChatCompletion, readModelList,
 } from './text.js';
 
-const VERSION = '2.3.0';
+const VERSION = '2.4.0';
 const TAG = '[FishTTS]';
 
 // 在酒馆助手脚本（iframe）里运行时，所有界面都画在酒馆主页面上
@@ -1422,6 +1422,7 @@ async function onEditorClick(e) {
 // ---------------------------------------------------------------- 语音面板
 
 const ui = { tab: 'discover', results: [], page: 1, hasMore: false, searching: false, historyShown: 100 };
+let historyFiltered = []; // 朗读历史当前筛选出的记录（供「导出全部 MP3」使用）
 let panelEl = null;
 const ref = (name) => panelEl.querySelector(`[data-ref="${name}"]`);
 const isPanelOpen = () => panelEl && !panelEl.classList.contains('fishtts-hidden');
@@ -1499,6 +1500,7 @@ function buildPanel() {
           <input type="search" class="text_pole" data-ref="hq" placeholder="搜索朗读内容或角色名">
           <label class="checkbox_label"><input type="checkbox" data-ref="hCurrent"> 只看当前聊天</label>
           <button type="button" class="menu_button" data-act="historyClear"><i class="fa-solid fa-trash-can"></i> 清空</button>
+          <button type="button" class="menu_button" data-act="hExportAll" title="把当前筛选出的记录逐个导出为 MP3 文件"><i class="fa-solid fa-file-arrow-down"></i> 导出全部 MP3</button>
         </div>
         <small class="fishtts-dim" data-ref="hInfo"></small>
         <div class="fishtts-list" data-ref="historyList"></div>
@@ -1761,6 +1763,7 @@ async function renderHistory() {
     const cur = ref('hCurrent').checked ? ctx().getCurrentChatId() : null;
     list = list.filter((r) => (!cur || r.chatId === cur) && (!q || `${r.name} ${r.text} ${r.chatLabel}`.toLowerCase().includes(q)));
     list.sort((a, b) => b.ts - a.ts);
+    historyFiltered = list;
     const size = await cacheSize();
     ref('hInfo').textContent = `共 ${total} 条记录${list.length !== total ? `，筛选出 ${list.length} 条` : ''} · 音频缓存 ${fmtBytes(size)} / ${S().cacheMB} MB（只保存在这个浏览器里）`;
     const shown = list.slice(0, ui.historyShown);
@@ -1778,6 +1781,7 @@ async function renderHistory() {
     <button type="button" class="menu_button" data-act="hPlay" data-id="${esc(r.id)}"><i class="fa-solid fa-play"></i> 重播</button>
     <button type="button" class="menu_button" data-act="hEdit" data-id="${esc(r.id)}" title="修改语气标签 / 文字后重新朗读"><i class="fa-solid fa-pen-to-square"></i> 编辑</button>
     <button type="button" class="menu_button" data-act="hLocate" data-id="${esc(r.id)}"><i class="fa-solid fa-location-crosshairs"></i> 定位</button>
+    <button type="button" class="menu_button" data-act="hExport" data-id="${esc(r.id)}" title="导出这条朗读的 MP3（缓存丢失会自动重新合成）"><i class="fa-solid fa-download"></i> 导出</button>
     <button type="button" class="menu_button" data-act="hDel" data-id="${esc(r.id)}" title="删除这条记录"><i class="fa-solid fa-trash-can"></i></button>
   </div>
 </div>`).join('') : `<div class="fishtts-empty">${total ? '没有符合条件的记录' : '还没有朗读记录'}</div>`;
@@ -1787,6 +1791,60 @@ async function renderHistory() {
 /** 转义后把 [标签] 高亮成小标签 */
 function highlightTags(text) {
     return esc(text).replace(/\[([^[\]\n]{1,40})\]/g, '<span class="fishtts-tagchip">[$1]</span>');
+}
+
+// ---------------------------------------------------------------- 导出朗读历史 MP3
+
+function downloadBlob(blob, filename) {
+    const a = doc.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    doc.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 8000);
+}
+
+const safeFile = (s) => String(s ?? '').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40) || 'fish-tts';
+
+/** 导出一条朗读记录的 MP3：优先用缓存，缓存被清理时自动重新合成。多段合并成一个文件。 */
+async function exportRecordMp3(recId) {
+    const rec = await idb.get('history', recId);
+    if (!rec?.segments?.length) { toast('warning', '这条记录没有可导出的音频'); return; }
+    const parts = [];
+    for (let i = 0; i < rec.segments.length; i++) {
+        const seg = rec.segments[i];
+        setStatus(`导出 ${rec.name} ${i + 1}/${rec.segments.length}…`);
+        const blob = await obtainAudio(seg);
+        parts.push(new Uint8Array(await blob.arrayBuffer()));
+    }
+    const blob = new Blob(parts, { type: 'audio/mpeg' });
+    downloadBlob(blob, `Fish语音_${safeFile(rec.name)}_${fmtTime(rec.ts).replace(/[\/: ]/g, '-')}.mp3`);
+    toast('success', `已导出「${rec.name}」的朗读 MP3`);
+}
+
+/** 批量导出当前筛选出的朗读记录（每条一个 MP3，间隔 400ms 避免浏览器拦截）。 */
+async function exportHistoryMp3() {
+    const list = historyFiltered.slice();
+    if (!list.length) { toast('info', '当前没有可导出的朗读记录'); return; }
+    setStatus(`批量导出 ${list.length} 条…`);
+    for (let i = 0; i < list.length; i++) {
+        const rec = list[i];
+        try {
+            const parts = [];
+            for (let k = 0; k < rec.segments.length; k++) {
+                const blob = await obtainAudio(rec.segments[k]);
+                parts.push(new Uint8Array(await blob.arrayBuffer()));
+            }
+            const blob = new Blob(parts, { type: 'audio/mpeg' });
+            downloadBlob(blob, `Fish语音_${safeFile(rec.name)}_${String(i + 1).padStart(3, '0')}.mp3`);
+            toast('success', `已导出 ${i + 1}/${list.length}`);
+        } catch (e) {
+            toast('error', `导出「${rec.name}」失败：${e.message}`);
+        }
+        await sleep(400);
+    }
+    setStatus(`批量导出完成`);
 }
 
 // ---- 面板事件
@@ -1868,6 +1926,8 @@ async function onPanelClick(e) {
                 break;
             }
             case 'hDel': await idb.del('history', id); renderHistory(); break;
+            case 'hExport': await exportRecordMp3(id); break;
+            case 'hExportAll': await exportHistoryMp3(); break;
             default: break;
         }
     } catch (err) {
